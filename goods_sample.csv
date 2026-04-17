@@ -1,9 +1,6 @@
-id,name,weight_kg,l,b,h,stackable,max_stack,adr,adr_class
-10009682,Unit,2700,3.70,1.63,1.77,true,1,false,
-10009685,Unit,2400,3.70,1.63,1.77,true,1,false,
-10009686,Cont,1400,2.10,1.54,1.80,true,1,false,
-10009687,Unit,3400,2.50,2.30,2.40,true,1,false,
-10009395,fatbasket,2800,3.70,1.63,1.79,true,1,false,
-10009400,spooler unit,3500,2.40,2.30,2.40,true,1,false,
-10009404,spooling unit,2900,2.15,1.91,2.06,true,1,false,
-10009399,spooler unit,4500,3.14,2.68,2.95,true,1,false,
+﻿id,truck_id,name,weight_kg,l,b,h,stackable,max_stack,adr,adr_class
+1,VC8543,Rør,600.00,12.00,0.20,0.20,true,1,false,
+2,VC8543,Pall,300.00,5.25,0.80,0.40,true,1,false,
+3,VC8543,Pall (SBR),260.00,3.30,0.80,0.65,true,1,false,
+4,VC8543,Pall (SBR),220.00,3.30,0.80,0.60,true,1,false,
+5,VC8543,PAll m/ 2 x gassflasker (SBR),60.00,1.20,0.80,0.35,true,1,false,

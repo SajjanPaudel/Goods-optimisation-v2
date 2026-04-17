@@ -42,10 +42,14 @@ TRUCKS_PAYLOAD: Dict[str, Any] = {
     ]
 }
 
+# Allow small height mismatch when treating support surfaces as coplanar.
+Z_COPLANAR_TOL = 1e-7
+
 
 @dataclass
 class Item:
     item_id: str
+    truck_id: str
     name: str
     weight: float
     l: float
@@ -171,12 +175,13 @@ def parse_trucks_from_json(payload: Dict[str, Any]) -> List[TruckType]:
 
 def read_goods(path: str) -> List[Item]:
     items: List[Item] = []
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             items.append(
                 Item(
                     item_id=row["id"],
+                    truck_id=row.get("truck_id", ""),
                     name=row.get("name", ""),
                     weight=float(row["weight_kg"]),
                     l=float(row["l"]),
@@ -337,7 +342,7 @@ def support_ratio(
     required_top = z
     rectangles: List[Tuple[float, float, float, float, int]] = []
     for i, p in enumerate(truck.placements):
-        if abs(p.z2 - required_top) > 1e-7:
+        if abs(p.z2 - required_top) > Z_COPLANAR_TOL:
             continue
         ix1, iy1 = max(x, p.x), max(y, p.y)
         ix2, iy2 = min(x + l, p.x2), min(y + w, p.y2)
@@ -392,7 +397,7 @@ def contiguous_support_ratio(
         return 1.0
     rects: List[Tuple[float, float, float, float]] = []
     for p in truck.placements:
-        if abs(p.z2 - z) > 1e-7:
+        if abs(p.z2 - z) > Z_COPLANAR_TOL:
             continue
         ix1, iy1 = max(x, p.x), max(y, p.y)
         ix2, iy2 = min(x + l, p.x2), min(y + w, p.y2)
@@ -436,6 +441,13 @@ def base_supports_stack(truck: TruckLoad, base_indices: List[int]) -> bool:
     return True
 
 
+def base_supports_weight_limit(truck: TruckLoad, base_indices: List[int], stacked_item_weight: float) -> bool:
+    if not base_indices:
+        return True
+    base_weight_sum = sum(truck.placements[idx].item.weight for idx in base_indices)
+    return stacked_item_weight <= base_weight_sum + 1e-9
+
+
 def can_place(
     truck: TruckLoad,
     x: float,
@@ -444,6 +456,7 @@ def can_place(
     l: float,
     w: float,
     h: float,
+    item_weight: float = 0.0,
     min_support_ratio: float = 0.98,
 ) -> Tuple[bool, List[int]]:
     if not within_truck(truck, x, y, z, l, w, h):
@@ -459,6 +472,8 @@ def can_place(
             return False, []
         if not base_supports_stack(truck, base_indices):
             return False, []
+        if not base_supports_weight_limit(truck, base_indices, item_weight):
+            return False, []
     return True, base_indices
 
 
@@ -470,7 +485,12 @@ def candidate_positions_floor(truck: TruckLoad) -> List[Tuple[float, float, floa
 
 
 def candidate_positions_stacked(truck: TruckLoad) -> List[Tuple[float, float, float]]:
-    z_levels = sorted({round(p.z2, 6) for p in truck.placements if p.z2 < truck.truck_type.h})
+    z_levels: List[float] = []
+    for p in sorted(truck.placements, key=lambda pl: pl.z2):
+        if p.z2 >= truck.truck_type.h:
+            continue
+        if not z_levels or abs(p.z2 - z_levels[-1]) > Z_COPLANAR_TOL:
+            z_levels.append(p.z2)
     if not z_levels:
         return []
     x_candidates = {0.0}
@@ -484,7 +504,7 @@ def candidate_positions_stacked(truck: TruckLoad) -> List[Tuple[float, float, fl
     out: List[Tuple[float, float, float]] = []
     for z in z_levels:
         for p in truck.placements:
-            if abs(p.z2 - z) < 1e-7:
+            if abs(p.z2 - z) <= Z_COPLANAR_TOL:
                 x_candidates.add(round(p.x, 4))
                 y_candidates.add(round(p.y, 4))
         for x in sorted(x_candidates):
@@ -623,7 +643,7 @@ def rebuild_top_free_rects(truck: TruckLoad, eps: float = 1e-4) -> None:
         for q in truck.placements:
             if q is base:
                 continue
-            if abs(q.z - base.z2) > eps:
+            if abs(q.z - base.z2) > Z_COPLANAR_TOL:
                 continue
             overlap = rect_overlap((base.x, base.y, base.l, base.w), (q.x, q.y, q.l, q.w), eps)
             if overlap is None:
@@ -668,7 +688,16 @@ def try_stack_single_base(
                     stack_level=base.stack_level + 1,
                     top_free_rects=[(0.0, 0.0, il, iw)],
                 )
-                ok, base_indices = can_place(truck, placement.x, placement.y, placement.z, placement.l, placement.w, placement.h)
+                ok, base_indices = can_place(
+                    truck,
+                    placement.x,
+                    placement.y,
+                    placement.z,
+                    placement.l,
+                    placement.w,
+                    placement.h,
+                    item_weight=placement.item.weight,
+                )
                 if not ok:
                     continue
                 placement.base_item_indices = base_indices
@@ -687,20 +716,21 @@ def try_stack_merged_coplanar(
 ) -> Optional[Placement]:
     if len(truck.placements) < 2:
         return None
-    grouped: Dict[float, List[Placement]] = {}
+    grouped: Dict[int, List[Placement]] = {}
     for p in truck.placements:
-        grouped.setdefault(round(p.z2, 6), []).append(p)
+        bucket = int(round(p.z2 / Z_COPLANAR_TOL)) if Z_COPLANAR_TOL > 0 else int(round(p.z2 * 1e6))
+        grouped.setdefault(bucket, []).append(p)
     best: Optional[Tuple[Tuple[float, float, float, float, float], Placement]] = None
-    for z_key, parts in grouped.items():
+    for _z_key, parts in grouped.items():
         if len(parts) < 2:
             continue
-        z_top = float(z_key)
+        z_top = sum(p.z2 for p in parts) / len(parts)
         if z_top + item.h > truck.truck_type.h + eps:
             continue
         merged = merge_free_rectangles([(p.x, p.y, p.l, p.w) for p in parts], eps=eps)
         free_list: List[Tuple[float, float, float, float]] = list(merged)
         for q in truck.placements:
-            if abs(q.z - z_top) > eps:
+            if abs(q.z - z_top) > Z_COPLANAR_TOL:
                 continue
             next_rects: List[Tuple[float, float, float, float]] = []
             for rect in free_list:
@@ -723,7 +753,16 @@ def try_stack_merged_coplanar(
                     stack_level=0,
                     top_free_rects=[(0.0, 0.0, il, iw)],
                 )
-                ok, base_indices = can_place(truck, placement.x, placement.y, placement.z, placement.l, placement.w, placement.h)
+                ok, base_indices = can_place(
+                    truck,
+                    placement.x,
+                    placement.y,
+                    placement.z,
+                    placement.l,
+                    placement.w,
+                    placement.h,
+                    item_weight=placement.item.weight,
+                )
                 if not ok or len(base_indices) < 2:
                     continue
                 placement.base_item_indices = base_indices
@@ -792,14 +831,29 @@ def place_item_by_rules(
 
 
 def create_new_truck(available_types: List[TruckType], item: Item) -> Optional[Tuple[int, TruckLoad]]:
+    compatible: List[Tuple[int, TruckType]] = []
     for idx, t in enumerate(available_types):
         if item.weight > t.max_weight:
             continue
         if item.h > t.h:
             continue
         if (item.l <= t.l and item.w <= t.w) or (item.w <= t.l and item.l <= t.w):
-            return idx, TruckLoad(truck_type=t)
-    return None
+            compatible.append((idx, t))
+    if not compatible:
+        return None
+
+    # Choose the smallest sufficient *new* truck.
+    # This tends to improve utilization by avoiding oversized vehicles.
+    best_idx, best_truck = min(
+        compatible,
+        key=lambda it: (
+            it[1].l * it[1].w * it[1].h,  # geometric volume
+            it[1].max_weight,             # payload capacity
+            it[1].l * it[1].w,            # floor area
+            it[1].l,                      # length
+        ),
+    )
+    return best_idx, TruckLoad(truck_type=best_truck)
 
 
 def overlap_area_xy(a: Placement, b: Placement) -> float:
@@ -816,7 +870,7 @@ def direct_supporters(truck: TruckLoad, idx: int, z_eps: float = 1e-4) -> List[i
         return []
     scored: List[Tuple[float, int]] = []
     for j, q in enumerate(truck.placements):
-        if idx == j or abs(q.z2 - p.z) > z_eps:
+        if idx == j or abs(q.z2 - p.z) > Z_COPLANAR_TOL:
             continue
         area = overlap_area_xy(p, q)
         if area > 1e-12:
@@ -878,7 +932,7 @@ def feasible_group_shift_x(truck: TruckLoad, group: set[int], dx: float, z_eps: 
             if i == j:
                 continue
             top_z = q.z2
-            if abs(top_z - p.z) > z_eps:
+            if abs(top_z - p.z) > Z_COPLANAR_TOL:
                 continue
             qx = x_at(j)
             overlap = rect_overlap((test.x, test.y, test.l, test.w), (qx, q.y, q.l, q.w))
@@ -927,7 +981,7 @@ def has_immediate_stack_child(truck: TruckLoad, idx: int, eps: float = 1e-4) -> 
     for j, q in enumerate(truck.placements):
         if idx == j:
             continue
-        if abs(q.z - p.z2) > eps:
+        if abs(q.z - p.z2) > Z_COPLANAR_TOL:
             continue
         if overlap_area_xy(p, q) > 1e-12:
             return True
@@ -1253,6 +1307,7 @@ def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
             placements.append(
                 {
                     "ID": int(p.item.item_id),
+                    "truck_id": p.item.truck_id,
                     "name": p.item.name,
                     "weight": p.item.weight,
                     "l": p.l,
@@ -1276,6 +1331,28 @@ def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
             }
         )
     return preview_plans
+
+
+def plan_preview_signature(plan: List[TruckLoad]) -> Tuple[Any, ...]:
+    """Stable signature for deduplicating visually identical plans."""
+    truck_sigs: List[Tuple[Any, ...]] = []
+    for truck in plan:
+        placements = tuple(
+            sorted(
+                (
+                    p.item.item_id,
+                    round(p.x, 4),
+                    round(p.y, 4),
+                    round(p.z, 4),
+                    round(p.l, 4),
+                    round(p.w, 4),
+                    round(p.h, 4),
+                )
+                for p in truck.placements
+            )
+        )
+        truck_sigs.append((truck.truck_type.truck_id, placements))
+    return tuple(truck_sigs)
 
 
 def visualize_plotly(plan: List[TruckLoad], plan_label: str = "Plan") -> None:
@@ -1352,15 +1429,26 @@ def main() -> None:
     if args.viz == "none":
         return
 
-    # When requested, preview the two best ranked plans automatically.
-    if args.preview_best_two:
-        to_show = plans[: min(2, len(plans))]
-        for i, (chosen, _unplaced) in enumerate(to_show, start=1):
-            print(f"\nOpening visualization for Plan {i}...")
+    # Auto-preview distinct plans when top-k > 1.
+    # Legacy support: --preview-best-two still forces a two-plan window.
+    if args.top_k > 1 or args.preview_best_two:
+        limit = min(2, len(plans)) if args.preview_best_two else min(args.top_k, len(plans))
+        seen = set()
+        distinct_to_show: List[Tuple[int, List[TruckLoad]]] = []
+        for rank, (candidate_plan, _unplaced) in enumerate(plans[:limit], start=1):
+            sig = plan_preview_signature(candidate_plan)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            distinct_to_show.append((rank, candidate_plan))
+
+        print(f"\nOpening {len(distinct_to_show)} distinct visualization(s) from top {limit} plan(s)...")
+        for rank, chosen in distinct_to_show:
+            print(f"  - Opening visualization for Plan {rank}...")
             if args.viz == "plotly":
-                visualize_plotly(chosen, plan_label=f"Plan {i}")
+                visualize_plotly(chosen, plan_label=f"Plan {rank}")
             else:
-                visualize_matplotlib(chosen, plan_label=f"Plan {i}")
+                visualize_matplotlib(chosen, plan_label=f"Plan {rank}")
         return
 
     idx = max(1, min(args.plan_index, len(plans))) - 1

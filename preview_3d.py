@@ -32,12 +32,13 @@ def _mesh3d_box_vertices(x0: float, y0: float, z0: float, l: float, b: float, h:
 
 def _placement_hover_lines(p: Dict[str, Any]) -> str:
     name = html.escape(str(p["name"]))
+    truck_id = html.escape(str(p["truck_id"]))
     adr_line = ""
     if p.get("adr", False):
         adr_class = str(p.get("adr_class", "") or "").strip()
         adr_line = f"<br><b>ADR</b> yes{f' (class {html.escape(adr_class)})' if adr_class else ''}"
     return (
-        f"<b>ID {p['ID']}</b><br>{name}<br>"
+        f"<b>ID {p['ID']}</b><br>{truck_id}{name}<br>"
         f"{adr_line}"
         f"<br><b>Dimensions</b> {p['l']:.3f} × {p['b']:.3f} × {p['h']:.3f} m<br>"
         f"<b>Position</b> {p['x']:.3f}, {p['y']:.3f}, {p['z']:.3f} m<br>"
@@ -140,7 +141,7 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         cols=cols,
         specs=[[{"type": "scatter3d"} for _ in range(cols)] for _ in range(rows)],
         subplot_titles=tuple(titles),
-        vertical_spacing=0.06,
+        vertical_spacing=0.01,
         horizontal_spacing=0.04,
     )
     fig.update_annotations(font=dict(size=18), yshift=-5)
@@ -182,7 +183,7 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         height=1000 * rows,
     )
 
-    zoom = 0.22
+    zoom = 0.12
     scene_layout: Dict[str, Any] = {}
     for idx, plan in enumerate(plans):
         dims = plan["truck_dims"]
@@ -197,6 +198,19 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
             camera=dict(eye=dict(x=1.35 / zoom, y=-1.55 / zoom, z=0.85 / zoom)),
         )
     fig.update_layout(**scene_layout)
+
+
+    fig.update_layout(
+            title_text=title,
+            paper_bgcolor="gray",  # Color of the whole canvas
+        )
+
+    fig.update_scenes(
+            xaxis_backgroundcolor="rgba(230, 230, 230, 0.5)",
+            yaxis_backgroundcolor="rgba(230, 230, 230, 0.5)",
+            zaxis_backgroundcolor="rgba(230, 230, 230, 0.5)",
+            bgcolor="white", # Color inside the 3D axes
+        )
     return fig
 
 
