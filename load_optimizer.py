@@ -4,10 +4,43 @@ from __future__ import annotations
 import argparse
 import csv
 import copy
+import json
 import math
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+# API-style payloads for future integration.
+# Replace these dicts with API response JSON when needed.
+GOODS_PAYLOAD: Dict[str, Any] = {
+    "goods": [
+        # {
+        #     "id": "10009399",
+        #     "name": "spooler unit",
+        #     "weight_kg": 4500,
+        #     "l": 3.14,
+        #     "b": 2.68,
+        #     "h": 2.95,
+        #     "stackable": True,
+        #     "max_stack": 1,
+        #     "adr": False,
+        #     "adr_class": "",
+        # }
+    ]
+}
+
+TRUCKS_PAYLOAD: Dict[str, Any] = {
+    "trucks": [
+        # {
+        #     "id": "1",
+        #     "name": "JUMBO Extendable trailer",
+        #     "l": 14.5,
+        #     "b": 4.0,
+        #     "h": 2.95,
+        #     "max_weight_kg": 100000,
+        # }
+    ]
+}
 
 
 @dataclass
@@ -97,6 +130,43 @@ class TruckLoad:
     def __post_init__(self) -> None:
         if not self.free_rects:
             self.free_rects = [(0.0, 0.0, self.truck_type.l, self.truck_type.w)]
+
+
+def parse_items_from_json(payload: Dict[str, Any]) -> List[Item]:
+    items: List[Item] = []
+    for row in payload.get("goods", []):
+        items.append(
+            Item(
+                item_id=str(row["id"]),
+                name=str(row.get("name", "")),
+                weight=float(row["weight_kg"]),
+                l=float(row["l"]),
+                w=float(row["b"]),
+                h=float(row["h"]),
+                stackable=bool(row.get("stackable", True)),
+                max_stack=int(row.get("max_stack", 1)),
+                adr=bool(row.get("adr", False)),
+                adr_class=str(row.get("adr_class", "") or "").strip(),
+            )
+        )
+    return items
+
+
+def parse_trucks_from_json(payload: Dict[str, Any]) -> List[TruckType]:
+    trucks: List[TruckType] = []
+    for row in payload.get("trucks", []):
+        trucks.append(
+            TruckType(
+                truck_id=str(row["id"]),
+                name=str(row.get("name", "")),
+                l=float(row["l"]),
+                w=float(row["b"]),
+                h=float(row["h"]),
+                max_weight=float(row["max_weight_kg"]),
+            )
+        )
+    trucks.sort(key=lambda t: (t.l, t.w * t.h, t.max_weight), reverse=True)
+    return trucks
 
 
 def read_goods(path: str) -> List[Item]:
@@ -1107,6 +1177,74 @@ def print_plan_summary(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> None:
                 )
 
 
+def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"plans": []}
+    for idx, (plan, unplaced) in enumerate(plans, start=1):
+        total_remaining, floor_remaining, air_remaining = plan_remaining_usable_volume(plan)
+        max_floor_area, max_air_area = plan_contiguous_space_metrics(plan)
+        used_volume, capacity_volume, volume_utilization = plan_volume_usage(plan)
+        trucks_out = []
+        for truck in plan:
+            placements = []
+            for p in sorted(truck.placements, key=lambda pl: (pl.x, pl.y, pl.z, pl.item.item_id)):
+                placements.append(
+                    {
+                        "id": p.item.item_id,
+                        "name": p.item.name,
+                        "weight_kg": p.item.weight,
+                        "size_m": {"l": p.l, "b": p.w, "h": p.h},
+                        "position_m": {"x": p.x, "y": p.y, "z": p.z},
+                        "level": p.stack_level,
+                        "adr": p.item.adr,
+                        "adr_class": p.item.adr_class,
+                    }
+                )
+            trucks_out.append(
+                {
+                    "truck_id": truck.truck_type.truck_id,
+                    "truck_name": truck.truck_type.name,
+                    "truck_dims_m": {"l": truck.truck_type.l, "b": truck.truck_type.w, "h": truck.truck_type.h},
+                    "max_weight_kg": truck.truck_type.max_weight,
+                    "weight_used_kg": truck.current_weight,
+                    "used_length_m": truck.used_length,
+                    "items_count": len(truck.placements),
+                    "placements": placements,
+                }
+            )
+        payload["plans"].append(
+            {
+                "plan_index": idx,
+                "summary": {
+                    "unplaced_count": len(unplaced),
+                    "truck_count": len(plan),
+                    "volume_used_m3": used_volume,
+                    "volume_capacity_m3": capacity_volume,
+                    "volume_utilization_pct": volume_utilization * 100.0,
+                    "remaining_usable_volume_m3": total_remaining,
+                    "remaining_floor_usable_volume_m3": floor_remaining,
+                    "remaining_air_usable_volume_m3": air_remaining,
+                    "largest_contiguous_floor_area_m2": max_floor_area,
+                    "largest_contiguous_air_area_m2": max_air_area,
+                    "total_used_length_m": sum(t.used_length for t in plan),
+                    "total_weight_kg": sum(t.current_weight for t in plan),
+                },
+                "trucks": trucks_out,
+                "unplaced_goods": [
+                    {
+                        "id": item.item_id,
+                        "name": item.name,
+                        "weight_kg": item.weight,
+                        "size_m": {"l": item.l, "b": item.w, "h": item.h},
+                        "adr": item.adr,
+                        "adr_class": item.adr_class,
+                    }
+                    for item in sorted(unplaced, key=lambda it: (-it.weight, it.item_id))
+                ],
+            }
+        )
+    return payload
+
+
 def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
     preview_plans: List[Dict[str, Any]] = []
     for truck in plan:
@@ -1164,8 +1302,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate 10 truck loading arrangements with floor-first + stacking heuristics.")
     parser.add_argument("--goods", default="goods_sample.csv", help="Path to goods CSV")
     parser.add_argument("--trucks", default="trucks_sample.csv", help="Path to trucks CSV")
+    parser.add_argument(
+        "--input-source",
+        choices=["json", "csv", "auto"],
+        default="auto",
+        help="Load inputs from top-level JSON payloads, CSV files, or auto (JSON when non-empty).",
+    )
     parser.add_argument("--top-k", type=int, default=10, help="Number of plans to keep")
     parser.add_argument("--attempts", type=int, default=240, help="Randomized search attempts")
+    parser.add_argument(
+        "--json-output",
+        choices=["none", "stdout", "both"],
+        default="none",
+        help="Emit structured JSON output to stdout as well (default: both text and JSON).",
+    )
     parser.add_argument("--viz", choices=["plotly", "matplotlib", "none"], default="plotly", help="Visualization backend")
     parser.add_argument("--plan-index", type=int, default=1, help="Plan to visualize (1-based index in ranked plans)")
     parser.add_argument(
@@ -1175,14 +1325,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    items = read_goods(args.goods)
-    trucks = read_trucks(args.trucks)
+    use_json = False
+    if args.input_source == "json":
+        use_json = True
+    elif args.input_source == "auto":
+        use_json = bool(GOODS_PAYLOAD.get("goods")) and bool(TRUCKS_PAYLOAD.get("trucks"))
+
+    if use_json:
+        items = parse_items_from_json(GOODS_PAYLOAD)
+        trucks = parse_trucks_from_json(TRUCKS_PAYLOAD)
+        if not items or not trucks:
+            raise SystemExit("JSON input selected but GOODS_PAYLOAD/TRUCKS_PAYLOAD are empty.")
+    else:
+        items = read_goods(args.goods)
+        trucks = read_trucks(args.trucks)
 
     plans = generate_candidates(items, trucks, count=args.top_k, attempts=args.attempts)
     if not plans:
         raise SystemExit("No loading plan could be generated.")
 
-    print_plan_summary(plans)
+    if args.json_output in ("none", "both"):
+        print_plan_summary(plans)
+    if args.json_output in ("stdout", "both"):
+        print("\nJSON output:")
+        print(json.dumps(plans_to_json(plans), indent=2))
     if args.viz == "none":
         return
 
