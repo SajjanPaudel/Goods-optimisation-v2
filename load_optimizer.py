@@ -91,6 +91,47 @@ class TruckType:
     w: float
     h: float
     max_weight: float
+    adr_suitable: bool = False
+    adr_classes_allowed: frozenset = field(default_factory=frozenset)
+
+
+def parse_adr_classes_allowed(raw: str) -> frozenset:
+    # Accepts "", "1", "1,2,3", "1-3", or mixed like "1-3,5".
+    if not raw:
+        return frozenset()
+    classes: set = set()
+    for chunk in str(raw).split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        if "-" in token:
+            lo_s, hi_s = token.split("-", 1)
+            lo_s, hi_s = lo_s.strip(), hi_s.strip()
+            try:
+                lo, hi = int(lo_s), int(hi_s)
+            except ValueError:
+                classes.add(token)
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            for n in range(lo, hi + 1):
+                classes.add(str(n))
+        else:
+            classes.add(token)
+    return frozenset(classes)
+
+
+def truck_allows_item_adr(truck: TruckType, item: "Item") -> bool:
+    # Non-ADR items can go on any truck.
+    if not item.adr:
+        return True
+    if not truck.adr_suitable:
+        return False
+    cls = (item.adr_class or "").strip()
+    if not cls:
+        # ADR item without a declared class cannot be validated against truck's allowed classes.
+        return False
+    return cls in truck.adr_classes_allowed
 
 
 @dataclass
@@ -167,6 +208,8 @@ def parse_trucks_from_json(payload: Dict[str, Any]) -> List[TruckType]:
                 w=float(row["b"]),
                 h=float(row["h"]),
                 max_weight=float(row["max_weight_kg"]),
+                adr_suitable=bool(row.get("adr_suitable", False)),
+                adr_classes_allowed=parse_adr_classes_allowed(str(row.get("adr_classes_allowed", "") or "")),
             )
         )
     trucks.sort(key=lambda t: (t.l, t.w * t.h, t.max_weight), reverse=True)
@@ -209,6 +252,8 @@ def read_trucks(path: str) -> List[TruckType]:
                     w=float(row["b"]),
                     h=float(row["h"]),
                     max_weight=float(row["max_weight_kg"]),
+                    adr_suitable=(row.get("adr_suitable", "false") or "false").strip().lower() == "true",
+                    adr_classes_allowed=parse_adr_classes_allowed(row.get("adr_classes_allowed", "") or ""),
                 )
             )
     # Prefer longer trucks first; this reduces split loads for long freight.
@@ -837,6 +882,8 @@ def create_new_truck(available_types: List[TruckType], item: Item) -> Optional[T
             continue
         if item.h > t.h:
             continue
+        if not truck_allows_item_adr(t, item):
+            continue
         if (item.l <= t.l and item.w <= t.w) or (item.w <= t.l and item.l <= t.w):
             compatible.append((idx, t))
     if not compatible:
@@ -1049,6 +1096,8 @@ def pack_once(items: List[Item], truck_types: List[TruckType], seed: int = 0) ->
             truck = trucks[idx]
             if not truck.can_take_weight(item.weight):
                 continue
+            if not truck_allows_item_adr(truck.truck_type, item):
+                continue
             saved_free_rects = copy.deepcopy(truck.free_rects)
             placement = place_item_by_rules(
                 item,
@@ -1139,6 +1188,29 @@ def largest_contiguous_air_area(truck: TruckLoad) -> float:
         for _, _, l, w in p.top_free_rects:
             best = max(best, l * w)
     return best
+
+
+def truck_front_back_weights(truck: TruckLoad) -> Tuple[float, float]:
+    # Split each item's weight proportionally across the truck's length midpoint.
+    mid = truck.truck_type.l / 2.0
+    front = 0.0
+    back = 0.0
+    for p in truck.placements:
+        if p.l <= 0:
+            continue
+        front_span = max(0.0, min(p.x2, mid) - p.x)
+        front_ratio = max(0.0, min(1.0, front_span / p.l))
+        front += p.item.weight * front_ratio
+        back += p.item.weight * (1.0 - front_ratio)
+    return front, back
+
+
+def format_plan_weight_balance(plan: List[TruckLoad]) -> str:
+    parts: List[str] = []
+    for truck in plan:
+        front, back = truck_front_back_weights(truck)
+        parts.append(f"{truck.truck_type.truck_id} Front {front:.0f}kg Back {back:.0f}kg")
+    return " | ".join(parts)
 
 
 def plan_contiguous_space_metrics(trucks: List[TruckLoad]) -> Tuple[float, float]:
@@ -1262,6 +1334,8 @@ def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, 
                     "weight_used_kg": truck.current_weight,
                     "used_length_m": truck.used_length,
                     "items_count": len(truck.placements),
+                    "adr_suitable": truck.truck_type.adr_suitable,
+                    "adr_classes_allowed": sorted(truck.truck_type.adr_classes_allowed),
                     "placements": placements,
                 }
             )
@@ -1321,12 +1395,15 @@ def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
                     "adr_class": p.item.adr_class,
                 }
             )
+        front_weight, back_weight = truck_front_back_weights(truck)
         preview_plans.append(
             {
                 "truck": truck.truck_type.truck_id,
                 "truck_dims": {"l": truck.truck_type.l, "b": truck.truck_type.w, "h": truck.truck_type.h},
                 "placed_count": len(placements),
                 "weight_util_pct": (truck.current_weight / truck.truck_type.max_weight * 100.0) if truck.truck_type.max_weight > 0 else 0.0,
+                "front_weight_kg": front_weight,
+                "back_weight_kg": back_weight,
                 "placements": placements,
             }
         )
@@ -1444,7 +1521,8 @@ def main() -> None:
 
         print(f"\nOpening {len(distinct_to_show)} distinct visualization(s) from top {limit} plan(s)...")
         for rank, chosen in distinct_to_show:
-            print(f"  - Opening visualization for Plan {rank}...")
+            balance = format_plan_weight_balance(chosen)
+            print(f"  - Opening visualization for Plan {rank}... {balance}")
             if args.viz == "plotly":
                 visualize_plotly(chosen, plan_label=f"Plan {rank}")
             else:
@@ -1453,6 +1531,8 @@ def main() -> None:
 
     idx = max(1, min(args.plan_index, len(plans))) - 1
     chosen, _unplaced = plans[idx]
+    balance = format_plan_weight_balance(chosen)
+    print(f"  - Opening visualization for Plan {idx + 1}... {balance}")
     if args.viz == "plotly":
         visualize_plotly(chosen, plan_label=f"Plan {idx + 1}")
     else:
