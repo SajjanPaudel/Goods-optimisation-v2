@@ -249,7 +249,7 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         height=1000 * rows,
     )
 
-    zoom = 0.12
+    zoom = 0.1
     scene_layout: Dict[str, Any] = {}
     for idx, plan in enumerate(plans):
         dims = plan["truck_dims"]

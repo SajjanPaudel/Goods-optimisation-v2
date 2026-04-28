@@ -8,7 +8,8 @@ import json
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 # API-style payloads for future integration.
 # Replace these dicts with API response JSON when needed.
@@ -59,6 +60,19 @@ class Item:
     max_stack: int
     adr: bool = False
     adr_class: str = ""
+    adr_class_2: str = ""
+
+    def adr_label_set(self) -> List[str]:
+        # Primary + subsidiary hazard labels the item carries (non-empty, stripped).
+        # Non-ADR items contribute no labels to the segregation check.
+        if not self.adr:
+            return []
+        labels = []
+        for raw in (self.adr_class, self.adr_class_2):
+            token = (raw or "").strip()
+            if token:
+                labels.append(token)
+        return labels
 
     def rotations_xy(self) -> List[Tuple[float, float, float]]:
         # Keep vertical axis as height; only rotate on floor plane.
@@ -91,47 +105,124 @@ class TruckType:
     w: float
     h: float
     max_weight: float
-    adr_suitable: bool = False
-    adr_classes_allowed: frozenset = field(default_factory=frozenset)
 
 
-def parse_adr_classes_allowed(raw: str) -> frozenset:
-    # Accepts "", "1", "1,2,3", "1-3", or mixed like "1-3,5".
-    if not raw:
-        return frozenset()
-    classes: set = set()
-    for chunk in str(raw).split(","):
-        token = chunk.strip()
-        if not token:
-            continue
-        if "-" in token:
-            lo_s, hi_s = token.split("-", 1)
-            lo_s, hi_s = lo_s.strip(), hi_s.strip()
-            try:
-                lo, hi = int(lo_s), int(hi_s)
-            except ValueError:
-                classes.add(token)
+# ADR pairwise segregation matrix, mirrors OWN_Combined_ADRLoad.
+# Values 1 and 9 mean the pair may travel together; anything else is forbidden.
+AdrPair = Tuple[str, str]
+AdrMatrix = Dict[AdrPair, int]
+ADR_ALLOWED_VALUES: FrozenSet[int] = frozenset({1, 9})
+_ADR_MATRIX_CACHE: Dict[str, AdrMatrix] = {}
+
+
+def load_adr_matrix(csv_path: str | Path = "hazard.csv") -> AdrMatrix:
+    key = str(Path(csv_path).resolve()) if Path(csv_path).exists() else str(csv_path)
+    cached = _ADR_MATRIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    matrix: AdrMatrix = {}
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        # Normalise column names: the reference CSV has whitespace in headers.
+        name_map = {(name or "").strip().lower(): name for name in (reader.fieldnames or [])}
+        h1_key = name_map.get("hazardlabel1")
+        h2_key = name_map.get("hazardlabel2")
+        val_key = name_map.get("adrvalue")
+        if not (h1_key and h2_key and val_key):
+            raise ValueError(
+                f"hazard matrix CSV at {csv_path} must contain columns "
+                "Hazardlabel1, Hazardlabel2, ADRValue"
+            )
+        for row in reader:
+            h1 = (row.get(h1_key) or "").strip()
+            h2 = (row.get(h2_key) or "").strip()
+            if not h1 or not h2:
                 continue
-            if lo > hi:
-                lo, hi = hi, lo
-            for n in range(lo, hi + 1):
-                classes.add(str(n))
-        else:
-            classes.add(token)
-    return frozenset(classes)
+            try:
+                val = int((row.get(val_key) or "").strip())
+            except (TypeError, ValueError):
+                continue
+            matrix[(h1, h2)] = val
+    _ADR_MATRIX_CACHE[key] = matrix
+    return matrix
 
 
-def truck_allows_item_adr(truck: TruckType, item: "Item") -> bool:
-    # Non-ADR items can go on any truck.
-    if not item.adr:
+def adr_pair_allowed(matrix: AdrMatrix, label1: str, label2: str) -> bool:
+    # Rule 2 from the original Delphi script: a pair is allowed only if the
+    # matrix value is 1 or 9. Missing entries are treated as forbidden, matching
+    # the original initialisation of bNotAllowed = TRUE.
+    a, b = (label1 or "").strip(), (label2 or "").strip()
+    print(f"label1 is: {a}, label2 is: {b}")
+    if not a or not b:
         return True
-    if not truck.adr_suitable:
+    val = matrix.get((a, b))
+    if val is None:
+        val = matrix.get((b, a))
+    if val is None:
         return False
-    cls = (item.adr_class or "").strip()
-    if not cls:
-        # ADR item without a declared class cannot be validated against truck's allowed classes.
+    return val in ADR_ALLOWED_VALUES
+
+
+def _classify_labels(labels: Iterable[str]) -> Tuple[bool, bool, bool, bool]:
+    c1 = c52 = c42 = cother = False
+    for raw in labels:
+        lbl = (raw or "").strip()
+        if not lbl:
+            continue
+        if lbl.startswith("1"):
+            c1 = True
+        elif lbl == "5.2":
+            c52 = True
+        elif lbl == "4.2":
+            c42 = True
+        else:
+            cother = True
+    return c1, c52, c42, cother
+
+
+def adr_class_mix_allowed(labels: Iterable[str]) -> bool:
+    # Rule 1 from the original Delphi script: forbid (class 1 + 5.2 + other)
+    # or (class 1 + 4.2 + other) on the same truck.
+    c1, c52, c42, cother = _classify_labels(labels)
+    if c1 and c52 and cother:
         return False
-    return cls in truck.adr_classes_allowed
+    if c1 and c42 and cother:
+        return False
+    return True
+
+
+def adr_load_allowed(matrix: AdrMatrix, labels_on_truck: Iterable[str]) -> bool:
+    # Combined check: the class-mix rule must hold AND every pairwise lookup
+    # (including the diagonal) must yield an ADRValue in {1, 9}.
+    labels = [lbl.strip() for lbl in labels_on_truck if lbl and lbl.strip()]
+    if not adr_class_mix_allowed(labels):
+        return False
+    for i, a in enumerate(labels):
+        for b in labels[i:]:
+            if not adr_pair_allowed(matrix, a, b):
+                return False
+    return True
+
+
+def truck_load_accepts_item_adr(
+    truck: "TruckLoad",
+    item: "Item",
+    matrix: Optional[AdrMatrix] = None,
+) -> bool:
+    # Set-level compatibility: ensure adding this item's labels keeps the
+    # truck's cumulative load within ADR segregation rules.
+    item_labels = item.adr_label_set()
+    if not item_labels:
+        return True
+    candidate = set(truck.adr_labels) | set(item_labels)
+    if matrix is None:
+        matrix = load_adr_matrix(ADR_MATRIX_PATH)
+    return adr_load_allowed(matrix, candidate)
+
+
+# Default path used by truck_load_accepts_item_adr when no matrix is provided.
+# main() overrides this from the --hazard-matrix CLI argument.
+ADR_MATRIX_PATH: str = "hazard.csv"
 
 
 @dataclass
@@ -168,6 +259,7 @@ class TruckLoad:
     current_weight: float = 0.0
     used_length: float = 0.0
     free_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
+    adr_labels: Set[str] = field(default_factory=set)
 
     def can_take_weight(self, weight: float) -> bool:
         return self.current_weight + weight <= self.truck_type.max_weight
@@ -192,6 +284,7 @@ def parse_items_from_json(payload: Dict[str, Any]) -> List[Item]:
                 max_stack=int(row.get("max_stack", 1)),
                 adr=bool(row.get("adr", False)),
                 adr_class=str(row.get("adr_class", "") or "").strip(),
+                adr_class_2=str(row.get("adr_class_2", "") or "").strip(),
             )
         )
     return items
@@ -208,8 +301,6 @@ def parse_trucks_from_json(payload: Dict[str, Any]) -> List[TruckType]:
                 w=float(row["b"]),
                 h=float(row["h"]),
                 max_weight=float(row["max_weight_kg"]),
-                adr_suitable=bool(row.get("adr_suitable", False)),
-                adr_classes_allowed=parse_adr_classes_allowed(str(row.get("adr_classes_allowed", "") or "")),
             )
         )
     trucks.sort(key=lambda t: (t.l, t.w * t.h, t.max_weight), reverse=True)
@@ -234,6 +325,7 @@ def read_goods(path: str) -> List[Item]:
                     max_stack=int(row.get("max_stack", "1") or 1),
                     adr=row.get("adr", "false").strip().lower() == "true",
                     adr_class=(row.get("adr_class", "") or "").strip(),
+                    adr_class_2=(row.get("adr_class_2", "") or "").strip(),
                 )
             )
     return items
@@ -252,8 +344,6 @@ def read_trucks(path: str) -> List[TruckType]:
                     w=float(row["b"]),
                     h=float(row["h"]),
                     max_weight=float(row["max_weight_kg"]),
-                    adr_suitable=(row.get("adr_suitable", "false") or "false").strip().lower() == "true",
-                    adr_classes_allowed=parse_adr_classes_allowed(row.get("adr_classes_allowed", "") or ""),
                 )
             )
     # Prefer longer trucks first; this reduces split loads for long freight.
@@ -882,8 +972,6 @@ def create_new_truck(available_types: List[TruckType], item: Item) -> Optional[T
             continue
         if item.h > t.h:
             continue
-        if not truck_allows_item_adr(t, item):
-            continue
         if (item.l <= t.l and item.w <= t.w) or (item.w <= t.l and item.l <= t.w):
             compatible.append((idx, t))
     if not compatible:
@@ -1096,7 +1184,7 @@ def pack_once(items: List[Item], truck_types: List[TruckType], seed: int = 0) ->
             truck = trucks[idx]
             if not truck.can_take_weight(item.weight):
                 continue
-            if not truck_allows_item_adr(truck.truck_type, item):
+            if not truck_load_accepts_item_adr(truck, item):
                 continue
             saved_free_rects = copy.deepcopy(truck.free_rects)
             placement = place_item_by_rules(
@@ -1112,6 +1200,7 @@ def pack_once(items: List[Item], truck_types: List[TruckType], seed: int = 0) ->
             truck.placements.append(placement)
             truck.current_weight += item.weight
             truck.used_length = max(truck.used_length, placement.x2)
+            truck.adr_labels.update(item.adr_label_set())
             rebuild_top_free_rects(truck)
             placed = True
             break
@@ -1135,6 +1224,7 @@ def pack_once(items: List[Item], truck_types: List[TruckType], seed: int = 0) ->
             new_truck.placements.append(placement)
             new_truck.current_weight += item.weight
             new_truck.used_length = max(new_truck.used_length, placement.x2)
+            new_truck.adr_labels.update(item.adr_label_set())
             rebuild_top_free_rects(new_truck)
             trucks.append(new_truck)
             unused_truck_types.pop(chosen_idx)
@@ -1323,6 +1413,7 @@ def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, 
                         "level": p.stack_level,
                         "adr": p.item.adr,
                         "adr_class": p.item.adr_class,
+                        "adr_class_2": p.item.adr_class_2,
                     }
                 )
             trucks_out.append(
@@ -1334,8 +1425,7 @@ def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, 
                     "weight_used_kg": truck.current_weight,
                     "used_length_m": truck.used_length,
                     "items_count": len(truck.placements),
-                    "adr_suitable": truck.truck_type.adr_suitable,
-                    "adr_classes_allowed": sorted(truck.truck_type.adr_classes_allowed),
+                    "adr_labels_loaded": sorted(truck.adr_labels),
                     "placements": placements,
                 }
             )
@@ -1365,6 +1455,7 @@ def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, 
                         "size_m": {"l": item.l, "b": item.w, "h": item.h},
                         "adr": item.adr,
                         "adr_class": item.adr_class,
+                        "adr_class_2": item.adr_class_2,
                     }
                     for item in sorted(unplaced, key=lambda it: (-it.weight, it.item_id))
                 ],
@@ -1393,6 +1484,7 @@ def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
                     "level": p.stack_level,
                     "adr": p.item.adr,
                     "adr_class": p.item.adr_class,
+                    "adr_class_2": p.item.adr_class_2,
                 }
             )
         front_weight, back_weight = truck_front_back_weights(truck)
@@ -1457,6 +1549,11 @@ def main() -> None:
     parser.add_argument("--goods", default="goods_sample.csv", help="Path to goods CSV")
     parser.add_argument("--trucks", default="trucks_sample.csv", help="Path to trucks CSV")
     parser.add_argument(
+        "--hazard-matrix",
+        default="hazard.csv",
+        help="Path to the ADR segregation matrix CSV (Hazardlabel1,Hazardlabel2,ADRValue).",
+    )
+    parser.add_argument(
         "--input-source",
         choices=["json", "csv", "auto"],
         default="auto",
@@ -1478,6 +1575,11 @@ def main() -> None:
         help="Automatically visualize plan 1 and 2 (if available).",
     )
     args = parser.parse_args()
+
+    global ADR_MATRIX_PATH
+    ADR_MATRIX_PATH = args.hazard_matrix
+    if Path(args.hazard_matrix).exists():
+        load_adr_matrix(args.hazard_matrix)
 
     use_json = False
     if args.input_source == "json":
