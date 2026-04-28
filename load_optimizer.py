@@ -4,15 +4,53 @@ from __future__ import annotations
 import argparse
 import csv
 import copy
+import json
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
+
+# API-style payloads for future integration.
+# Replace these dicts with API response JSON when needed.
+GOODS_PAYLOAD: Dict[str, Any] = {
+    "goods": [
+        # {
+        #     "id": "10009399",
+        #     "name": "spooler unit",
+        #     "weight_kg": 4500,
+        #     "l": 3.14,
+        #     "b": 2.68,
+        #     "h": 2.95,
+        #     "stackable": True,
+        #     "max_stack": 1,
+        #     "adr": False,
+        #     "adr_class": "",
+        # }
+    ]
+}
+
+TRUCKS_PAYLOAD: Dict[str, Any] = {
+    "trucks": [
+        # {
+        #     "id": "1",
+        #     "name": "JUMBO Extendable trailer",
+        #     "l": 14.5,
+        #     "b": 4.0,
+        #     "h": 2.95,
+        #     "max_weight_kg": 100000,
+        # }
+    ]
+}
+
+# Allow small height mismatch when treating support surfaces as coplanar.
+Z_COPLANAR_TOL = 1e-7
 
 
 @dataclass
 class Item:
     item_id: str
+    truck_id: str
     name: str
     weight: float
     l: float
@@ -22,6 +60,19 @@ class Item:
     max_stack: int
     adr: bool = False
     adr_class: str = ""
+    adr_class_2: str = ""
+
+    def adr_label_set(self) -> List[str]:
+        # Primary + subsidiary hazard labels the item carries (non-empty, stripped).
+        # Non-ADR items contribute no labels to the segregation check.
+        if not self.adr:
+            return []
+        labels = []
+        for raw in (self.adr_class, self.adr_class_2):
+            token = (raw or "").strip()
+            if token:
+                labels.append(token)
+        return labels
 
     def rotations_xy(self) -> List[Tuple[float, float, float]]:
         # Keep vertical axis as height; only rotate on floor plane.
@@ -54,6 +105,124 @@ class TruckType:
     w: float
     h: float
     max_weight: float
+
+
+# ADR pairwise segregation matrix, mirrors OWN_Combined_ADRLoad.
+# Values 1 and 9 mean the pair may travel together; anything else is forbidden.
+AdrPair = Tuple[str, str]
+AdrMatrix = Dict[AdrPair, int]
+ADR_ALLOWED_VALUES: FrozenSet[int] = frozenset({1, 9})
+_ADR_MATRIX_CACHE: Dict[str, AdrMatrix] = {}
+
+
+def load_adr_matrix(csv_path: str | Path = "hazard.csv") -> AdrMatrix:
+    key = str(Path(csv_path).resolve()) if Path(csv_path).exists() else str(csv_path)
+    cached = _ADR_MATRIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    matrix: AdrMatrix = {}
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        # Normalise column names: the reference CSV has whitespace in headers.
+        name_map = {(name or "").strip().lower(): name for name in (reader.fieldnames or [])}
+        h1_key = name_map.get("hazardlabel1")
+        h2_key = name_map.get("hazardlabel2")
+        val_key = name_map.get("adrvalue")
+        if not (h1_key and h2_key and val_key):
+            raise ValueError(
+                f"hazard matrix CSV at {csv_path} must contain columns "
+                "Hazardlabel1, Hazardlabel2, ADRValue"
+            )
+        for row in reader:
+            h1 = (row.get(h1_key) or "").strip()
+            h2 = (row.get(h2_key) or "").strip()
+            if not h1 or not h2:
+                continue
+            try:
+                val = int((row.get(val_key) or "").strip())
+            except (TypeError, ValueError):
+                continue
+            matrix[(h1, h2)] = val
+    _ADR_MATRIX_CACHE[key] = matrix
+    return matrix
+
+
+def adr_pair_allowed(matrix: AdrMatrix, label1: str, label2: str) -> bool:
+    # Rule 2 from the original Delphi script: a pair is allowed only if the
+    # matrix value is 1 or 9. Missing entries are treated as forbidden, matching
+    # the original initialisation of bNotAllowed = TRUE.
+    a, b = (label1 or "").strip(), (label2 or "").strip()
+    print(f"label1 is: {a}, label2 is: {b}")
+    if not a or not b:
+        return True
+    val = matrix.get((a, b))
+    if val is None:
+        val = matrix.get((b, a))
+    if val is None:
+        return False
+    return val in ADR_ALLOWED_VALUES
+
+
+def _classify_labels(labels: Iterable[str]) -> Tuple[bool, bool, bool, bool]:
+    c1 = c52 = c42 = cother = False
+    for raw in labels:
+        lbl = (raw or "").strip()
+        if not lbl:
+            continue
+        if lbl.startswith("1"):
+            c1 = True
+        elif lbl == "5.2":
+            c52 = True
+        elif lbl == "4.2":
+            c42 = True
+        else:
+            cother = True
+    return c1, c52, c42, cother
+
+
+def adr_class_mix_allowed(labels: Iterable[str]) -> bool:
+    # Rule 1 from the original Delphi script: forbid (class 1 + 5.2 + other)
+    # or (class 1 + 4.2 + other) on the same truck.
+    c1, c52, c42, cother = _classify_labels(labels)
+    if c1 and c52 and cother:
+        return False
+    if c1 and c42 and cother:
+        return False
+    return True
+
+
+def adr_load_allowed(matrix: AdrMatrix, labels_on_truck: Iterable[str]) -> bool:
+    # Combined check: the class-mix rule must hold AND every pairwise lookup
+    # (including the diagonal) must yield an ADRValue in {1, 9}.
+    labels = [lbl.strip() for lbl in labels_on_truck if lbl and lbl.strip()]
+    if not adr_class_mix_allowed(labels):
+        return False
+    for i, a in enumerate(labels):
+        for b in labels[i:]:
+            if not adr_pair_allowed(matrix, a, b):
+                return False
+    return True
+
+
+def truck_load_accepts_item_adr(
+    truck: "TruckLoad",
+    item: "Item",
+    matrix: Optional[AdrMatrix] = None,
+) -> bool:
+    # Set-level compatibility: ensure adding this item's labels keeps the
+    # truck's cumulative load within ADR segregation rules.
+    item_labels = item.adr_label_set()
+    if not item_labels:
+        return True
+    candidate = set(truck.adr_labels) | set(item_labels)
+    if matrix is None:
+        matrix = load_adr_matrix(ADR_MATRIX_PATH)
+    return adr_load_allowed(matrix, candidate)
+
+
+# Default path used by truck_load_accepts_item_adr when no matrix is provided.
+# main() overrides this from the --hazard-matrix CLI argument.
+ADR_MATRIX_PATH: str = "hazard.csv"
 
 
 @dataclass
@@ -90,6 +259,7 @@ class TruckLoad:
     current_weight: float = 0.0
     used_length: float = 0.0
     free_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
+    adr_labels: Set[str] = field(default_factory=set)
 
     def can_take_weight(self, weight: float) -> bool:
         return self.current_weight + weight <= self.truck_type.max_weight
@@ -99,14 +269,53 @@ class TruckLoad:
             self.free_rects = [(0.0, 0.0, self.truck_type.l, self.truck_type.w)]
 
 
+def parse_items_from_json(payload: Dict[str, Any]) -> List[Item]:
+    items: List[Item] = []
+    for row in payload.get("goods", []):
+        items.append(
+            Item(
+                item_id=str(row["id"]),
+                name=str(row.get("name", "")),
+                weight=float(row["weight_kg"]),
+                l=float(row["l"]),
+                w=float(row["b"]),
+                h=float(row["h"]),
+                stackable=bool(row.get("stackable", True)),
+                max_stack=int(row.get("max_stack", 1)),
+                adr=bool(row.get("adr", False)),
+                adr_class=str(row.get("adr_class", "") or "").strip(),
+                adr_class_2=str(row.get("adr_class_2", "") or "").strip(),
+            )
+        )
+    return items
+
+
+def parse_trucks_from_json(payload: Dict[str, Any]) -> List[TruckType]:
+    trucks: List[TruckType] = []
+    for row in payload.get("trucks", []):
+        trucks.append(
+            TruckType(
+                truck_id=str(row["id"]),
+                name=str(row.get("name", "")),
+                l=float(row["l"]),
+                w=float(row["b"]),
+                h=float(row["h"]),
+                max_weight=float(row["max_weight_kg"]),
+            )
+        )
+    trucks.sort(key=lambda t: (t.l, t.w * t.h, t.max_weight), reverse=True)
+    return trucks
+
+
 def read_goods(path: str) -> List[Item]:
     items: List[Item] = []
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             items.append(
                 Item(
                     item_id=row["id"],
+                    truck_id=row.get("truck_id", ""),
                     name=row.get("name", ""),
                     weight=float(row["weight_kg"]),
                     l=float(row["l"]),
@@ -116,6 +325,7 @@ def read_goods(path: str) -> List[Item]:
                     max_stack=int(row.get("max_stack", "1") or 1),
                     adr=row.get("adr", "false").strip().lower() == "true",
                     adr_class=(row.get("adr_class", "") or "").strip(),
+                    adr_class_2=(row.get("adr_class_2", "") or "").strip(),
                 )
             )
     return items
@@ -267,7 +477,7 @@ def support_ratio(
     required_top = z
     rectangles: List[Tuple[float, float, float, float, int]] = []
     for i, p in enumerate(truck.placements):
-        if abs(p.z2 - required_top) > 1e-7:
+        if abs(p.z2 - required_top) > Z_COPLANAR_TOL:
             continue
         ix1, iy1 = max(x, p.x), max(y, p.y)
         ix2, iy2 = min(x + l, p.x2), min(y + w, p.y2)
@@ -322,7 +532,7 @@ def contiguous_support_ratio(
         return 1.0
     rects: List[Tuple[float, float, float, float]] = []
     for p in truck.placements:
-        if abs(p.z2 - z) > 1e-7:
+        if abs(p.z2 - z) > Z_COPLANAR_TOL:
             continue
         ix1, iy1 = max(x, p.x), max(y, p.y)
         ix2, iy2 = min(x + l, p.x2), min(y + w, p.y2)
@@ -366,6 +576,13 @@ def base_supports_stack(truck: TruckLoad, base_indices: List[int]) -> bool:
     return True
 
 
+def base_supports_weight_limit(truck: TruckLoad, base_indices: List[int], stacked_item_weight: float) -> bool:
+    if not base_indices:
+        return True
+    base_weight_sum = sum(truck.placements[idx].item.weight for idx in base_indices)
+    return stacked_item_weight <= base_weight_sum + 1e-9
+
+
 def can_place(
     truck: TruckLoad,
     x: float,
@@ -374,6 +591,7 @@ def can_place(
     l: float,
     w: float,
     h: float,
+    item_weight: float = 0.0,
     min_support_ratio: float = 0.98,
 ) -> Tuple[bool, List[int]]:
     if not within_truck(truck, x, y, z, l, w, h):
@@ -389,6 +607,8 @@ def can_place(
             return False, []
         if not base_supports_stack(truck, base_indices):
             return False, []
+        if not base_supports_weight_limit(truck, base_indices, item_weight):
+            return False, []
     return True, base_indices
 
 
@@ -400,7 +620,12 @@ def candidate_positions_floor(truck: TruckLoad) -> List[Tuple[float, float, floa
 
 
 def candidate_positions_stacked(truck: TruckLoad) -> List[Tuple[float, float, float]]:
-    z_levels = sorted({round(p.z2, 6) for p in truck.placements if p.z2 < truck.truck_type.h})
+    z_levels: List[float] = []
+    for p in sorted(truck.placements, key=lambda pl: pl.z2):
+        if p.z2 >= truck.truck_type.h:
+            continue
+        if not z_levels or abs(p.z2 - z_levels[-1]) > Z_COPLANAR_TOL:
+            z_levels.append(p.z2)
     if not z_levels:
         return []
     x_candidates = {0.0}
@@ -414,7 +639,7 @@ def candidate_positions_stacked(truck: TruckLoad) -> List[Tuple[float, float, fl
     out: List[Tuple[float, float, float]] = []
     for z in z_levels:
         for p in truck.placements:
-            if abs(p.z2 - z) < 1e-7:
+            if abs(p.z2 - z) <= Z_COPLANAR_TOL:
                 x_candidates.add(round(p.x, 4))
                 y_candidates.add(round(p.y, 4))
         for x in sorted(x_candidates):
@@ -553,7 +778,7 @@ def rebuild_top_free_rects(truck: TruckLoad, eps: float = 1e-4) -> None:
         for q in truck.placements:
             if q is base:
                 continue
-            if abs(q.z - base.z2) > eps:
+            if abs(q.z - base.z2) > Z_COPLANAR_TOL:
                 continue
             overlap = rect_overlap((base.x, base.y, base.l, base.w), (q.x, q.y, q.l, q.w), eps)
             if overlap is None:
@@ -598,7 +823,16 @@ def try_stack_single_base(
                     stack_level=base.stack_level + 1,
                     top_free_rects=[(0.0, 0.0, il, iw)],
                 )
-                ok, base_indices = can_place(truck, placement.x, placement.y, placement.z, placement.l, placement.w, placement.h)
+                ok, base_indices = can_place(
+                    truck,
+                    placement.x,
+                    placement.y,
+                    placement.z,
+                    placement.l,
+                    placement.w,
+                    placement.h,
+                    item_weight=placement.item.weight,
+                )
                 if not ok:
                     continue
                 placement.base_item_indices = base_indices
@@ -617,20 +851,21 @@ def try_stack_merged_coplanar(
 ) -> Optional[Placement]:
     if len(truck.placements) < 2:
         return None
-    grouped: Dict[float, List[Placement]] = {}
+    grouped: Dict[int, List[Placement]] = {}
     for p in truck.placements:
-        grouped.setdefault(round(p.z2, 6), []).append(p)
+        bucket = int(round(p.z2 / Z_COPLANAR_TOL)) if Z_COPLANAR_TOL > 0 else int(round(p.z2 * 1e6))
+        grouped.setdefault(bucket, []).append(p)
     best: Optional[Tuple[Tuple[float, float, float, float, float], Placement]] = None
-    for z_key, parts in grouped.items():
+    for _z_key, parts in grouped.items():
         if len(parts) < 2:
             continue
-        z_top = float(z_key)
+        z_top = sum(p.z2 for p in parts) / len(parts)
         if z_top + item.h > truck.truck_type.h + eps:
             continue
         merged = merge_free_rectangles([(p.x, p.y, p.l, p.w) for p in parts], eps=eps)
         free_list: List[Tuple[float, float, float, float]] = list(merged)
         for q in truck.placements:
-            if abs(q.z - z_top) > eps:
+            if abs(q.z - z_top) > Z_COPLANAR_TOL:
                 continue
             next_rects: List[Tuple[float, float, float, float]] = []
             for rect in free_list:
@@ -653,7 +888,16 @@ def try_stack_merged_coplanar(
                     stack_level=0,
                     top_free_rects=[(0.0, 0.0, il, iw)],
                 )
-                ok, base_indices = can_place(truck, placement.x, placement.y, placement.z, placement.l, placement.w, placement.h)
+                ok, base_indices = can_place(
+                    truck,
+                    placement.x,
+                    placement.y,
+                    placement.z,
+                    placement.l,
+                    placement.w,
+                    placement.h,
+                    item_weight=placement.item.weight,
+                )
                 if not ok or len(base_indices) < 2:
                     continue
                 placement.base_item_indices = base_indices
@@ -722,14 +966,29 @@ def place_item_by_rules(
 
 
 def create_new_truck(available_types: List[TruckType], item: Item) -> Optional[Tuple[int, TruckLoad]]:
+    compatible: List[Tuple[int, TruckType]] = []
     for idx, t in enumerate(available_types):
         if item.weight > t.max_weight:
             continue
         if item.h > t.h:
             continue
         if (item.l <= t.l and item.w <= t.w) or (item.w <= t.l and item.l <= t.w):
-            return idx, TruckLoad(truck_type=t)
-    return None
+            compatible.append((idx, t))
+    if not compatible:
+        return None
+
+    # Choose the smallest sufficient *new* truck.
+    # This tends to improve utilization by avoiding oversized vehicles.
+    best_idx, best_truck = min(
+        compatible,
+        key=lambda it: (
+            it[1].l * it[1].w * it[1].h,  # geometric volume
+            it[1].max_weight,             # payload capacity
+            it[1].l * it[1].w,            # floor area
+            it[1].l,                      # length
+        ),
+    )
+    return best_idx, TruckLoad(truck_type=best_truck)
 
 
 def overlap_area_xy(a: Placement, b: Placement) -> float:
@@ -746,7 +1005,7 @@ def direct_supporters(truck: TruckLoad, idx: int, z_eps: float = 1e-4) -> List[i
         return []
     scored: List[Tuple[float, int]] = []
     for j, q in enumerate(truck.placements):
-        if idx == j or abs(q.z2 - p.z) > z_eps:
+        if idx == j or abs(q.z2 - p.z) > Z_COPLANAR_TOL:
             continue
         area = overlap_area_xy(p, q)
         if area > 1e-12:
@@ -808,7 +1067,7 @@ def feasible_group_shift_x(truck: TruckLoad, group: set[int], dx: float, z_eps: 
             if i == j:
                 continue
             top_z = q.z2
-            if abs(top_z - p.z) > z_eps:
+            if abs(top_z - p.z) > Z_COPLANAR_TOL:
                 continue
             qx = x_at(j)
             overlap = rect_overlap((test.x, test.y, test.l, test.w), (qx, q.y, q.l, q.w))
@@ -857,7 +1116,7 @@ def has_immediate_stack_child(truck: TruckLoad, idx: int, eps: float = 1e-4) -> 
     for j, q in enumerate(truck.placements):
         if idx == j:
             continue
-        if abs(q.z - p.z2) > eps:
+        if abs(q.z - p.z2) > Z_COPLANAR_TOL:
             continue
         if overlap_area_xy(p, q) > 1e-12:
             return True
@@ -925,6 +1184,8 @@ def pack_once(items: List[Item], truck_types: List[TruckType], seed: int = 0) ->
             truck = trucks[idx]
             if not truck.can_take_weight(item.weight):
                 continue
+            if not truck_load_accepts_item_adr(truck, item):
+                continue
             saved_free_rects = copy.deepcopy(truck.free_rects)
             placement = place_item_by_rules(
                 item,
@@ -939,6 +1200,7 @@ def pack_once(items: List[Item], truck_types: List[TruckType], seed: int = 0) ->
             truck.placements.append(placement)
             truck.current_weight += item.weight
             truck.used_length = max(truck.used_length, placement.x2)
+            truck.adr_labels.update(item.adr_label_set())
             rebuild_top_free_rects(truck)
             placed = True
             break
@@ -962,6 +1224,7 @@ def pack_once(items: List[Item], truck_types: List[TruckType], seed: int = 0) ->
             new_truck.placements.append(placement)
             new_truck.current_weight += item.weight
             new_truck.used_length = max(new_truck.used_length, placement.x2)
+            new_truck.adr_labels.update(item.adr_label_set())
             rebuild_top_free_rects(new_truck)
             trucks.append(new_truck)
             unused_truck_types.pop(chosen_idx)
@@ -1015,6 +1278,29 @@ def largest_contiguous_air_area(truck: TruckLoad) -> float:
         for _, _, l, w in p.top_free_rects:
             best = max(best, l * w)
     return best
+
+
+def truck_front_back_weights(truck: TruckLoad) -> Tuple[float, float]:
+    # Split each item's weight proportionally across the truck's length midpoint.
+    mid = truck.truck_type.l / 2.0
+    front = 0.0
+    back = 0.0
+    for p in truck.placements:
+        if p.l <= 0:
+            continue
+        front_span = max(0.0, min(p.x2, mid) - p.x)
+        front_ratio = max(0.0, min(1.0, front_span / p.l))
+        front += p.item.weight * front_ratio
+        back += p.item.weight * (1.0 - front_ratio)
+    return front, back
+
+
+def format_plan_weight_balance(plan: List[TruckLoad]) -> str:
+    parts: List[str] = []
+    for truck in plan:
+        front, back = truck_front_back_weights(truck)
+        parts.append(f"{truck.truck_type.truck_id} Front {front:.0f}kg Back {back:.0f}kg")
+    return " | ".join(parts)
 
 
 def plan_contiguous_space_metrics(trucks: List[TruckLoad]) -> Tuple[float, float]:
@@ -1107,6 +1393,77 @@ def print_plan_summary(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> None:
                 )
 
 
+def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"plans": []}
+    for idx, (plan, unplaced) in enumerate(plans, start=1):
+        total_remaining, floor_remaining, air_remaining = plan_remaining_usable_volume(plan)
+        max_floor_area, max_air_area = plan_contiguous_space_metrics(plan)
+        used_volume, capacity_volume, volume_utilization = plan_volume_usage(plan)
+        trucks_out = []
+        for truck in plan:
+            placements = []
+            for p in sorted(truck.placements, key=lambda pl: (pl.x, pl.y, pl.z, pl.item.item_id)):
+                placements.append(
+                    {
+                        "id": p.item.item_id,
+                        "name": p.item.name,
+                        "weight_kg": p.item.weight,
+                        "size_m": {"l": p.l, "b": p.w, "h": p.h},
+                        "position_m": {"x": p.x, "y": p.y, "z": p.z},
+                        "level": p.stack_level,
+                        "adr": p.item.adr,
+                        "adr_class": p.item.adr_class,
+                        "adr_class_2": p.item.adr_class_2,
+                    }
+                )
+            trucks_out.append(
+                {
+                    "truck_id": truck.truck_type.truck_id,
+                    "truck_name": truck.truck_type.name,
+                    "truck_dims_m": {"l": truck.truck_type.l, "b": truck.truck_type.w, "h": truck.truck_type.h},
+                    "max_weight_kg": truck.truck_type.max_weight,
+                    "weight_used_kg": truck.current_weight,
+                    "used_length_m": truck.used_length,
+                    "items_count": len(truck.placements),
+                    "adr_labels_loaded": sorted(truck.adr_labels),
+                    "placements": placements,
+                }
+            )
+        payload["plans"].append(
+            {
+                "plan_index": idx,
+                "summary": {
+                    "unplaced_count": len(unplaced),
+                    "truck_count": len(plan),
+                    "volume_used_m3": used_volume,
+                    "volume_capacity_m3": capacity_volume,
+                    "volume_utilization_pct": volume_utilization * 100.0,
+                    "remaining_usable_volume_m3": total_remaining,
+                    "remaining_floor_usable_volume_m3": floor_remaining,
+                    "remaining_air_usable_volume_m3": air_remaining,
+                    "largest_contiguous_floor_area_m2": max_floor_area,
+                    "largest_contiguous_air_area_m2": max_air_area,
+                    "total_used_length_m": sum(t.used_length for t in plan),
+                    "total_weight_kg": sum(t.current_weight for t in plan),
+                },
+                "trucks": trucks_out,
+                "unplaced_goods": [
+                    {
+                        "id": item.item_id,
+                        "name": item.name,
+                        "weight_kg": item.weight,
+                        "size_m": {"l": item.l, "b": item.w, "h": item.h},
+                        "adr": item.adr,
+                        "adr_class": item.adr_class,
+                        "adr_class_2": item.adr_class_2,
+                    }
+                    for item in sorted(unplaced, key=lambda it: (-it.weight, it.item_id))
+                ],
+            }
+        )
+    return payload
+
+
 def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
     preview_plans: List[Dict[str, Any]] = []
     for truck in plan:
@@ -1115,6 +1472,7 @@ def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
             placements.append(
                 {
                     "ID": int(p.item.item_id),
+                    "truck_id": p.item.truck_id,
                     "name": p.item.name,
                     "weight": p.item.weight,
                     "l": p.l,
@@ -1126,18 +1484,44 @@ def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
                     "level": p.stack_level,
                     "adr": p.item.adr,
                     "adr_class": p.item.adr_class,
+                    "adr_class_2": p.item.adr_class_2,
                 }
             )
+        front_weight, back_weight = truck_front_back_weights(truck)
         preview_plans.append(
             {
                 "truck": truck.truck_type.truck_id,
                 "truck_dims": {"l": truck.truck_type.l, "b": truck.truck_type.w, "h": truck.truck_type.h},
                 "placed_count": len(placements),
                 "weight_util_pct": (truck.current_weight / truck.truck_type.max_weight * 100.0) if truck.truck_type.max_weight > 0 else 0.0,
+                "front_weight_kg": front_weight,
+                "back_weight_kg": back_weight,
                 "placements": placements,
             }
         )
     return preview_plans
+
+
+def plan_preview_signature(plan: List[TruckLoad]) -> Tuple[Any, ...]:
+    """Stable signature for deduplicating visually identical plans."""
+    truck_sigs: List[Tuple[Any, ...]] = []
+    for truck in plan:
+        placements = tuple(
+            sorted(
+                (
+                    p.item.item_id,
+                    round(p.x, 4),
+                    round(p.y, 4),
+                    round(p.z, 4),
+                    round(p.l, 4),
+                    round(p.w, 4),
+                    round(p.h, 4),
+                )
+                for p in truck.placements
+            )
+        )
+        truck_sigs.append((truck.truck_type.truck_id, placements))
+    return tuple(truck_sigs)
 
 
 def visualize_plotly(plan: List[TruckLoad], plan_label: str = "Plan") -> None:
@@ -1164,8 +1548,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate 10 truck loading arrangements with floor-first + stacking heuristics.")
     parser.add_argument("--goods", default="goods_sample.csv", help="Path to goods CSV")
     parser.add_argument("--trucks", default="trucks_sample.csv", help="Path to trucks CSV")
+    parser.add_argument(
+        "--hazard-matrix",
+        default="hazard.csv",
+        help="Path to the ADR segregation matrix CSV (Hazardlabel1,Hazardlabel2,ADRValue).",
+    )
+    parser.add_argument(
+        "--input-source",
+        choices=["json", "csv", "auto"],
+        default="auto",
+        help="Load inputs from top-level JSON payloads, CSV files, or auto (JSON when non-empty).",
+    )
     parser.add_argument("--top-k", type=int, default=10, help="Number of plans to keep")
     parser.add_argument("--attempts", type=int, default=240, help="Randomized search attempts")
+    parser.add_argument(
+        "--json-output",
+        choices=["none", "stdout", "both"],
+        default="none",
+        help="Emit structured JSON output to stdout as well (default: both text and JSON).",
+    )
     parser.add_argument("--viz", choices=["plotly", "matplotlib", "none"], default="plotly", help="Visualization backend")
     parser.add_argument("--plan-index", type=int, default=1, help="Plan to visualize (1-based index in ranked plans)")
     parser.add_argument(
@@ -1175,30 +1576,65 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    items = read_goods(args.goods)
-    trucks = read_trucks(args.trucks)
+    global ADR_MATRIX_PATH
+    ADR_MATRIX_PATH = args.hazard_matrix
+    if Path(args.hazard_matrix).exists():
+        load_adr_matrix(args.hazard_matrix)
+
+    use_json = False
+    if args.input_source == "json":
+        use_json = True
+    elif args.input_source == "auto":
+        use_json = bool(GOODS_PAYLOAD.get("goods")) and bool(TRUCKS_PAYLOAD.get("trucks"))
+
+    if use_json:
+        items = parse_items_from_json(GOODS_PAYLOAD)
+        trucks = parse_trucks_from_json(TRUCKS_PAYLOAD)
+        if not items or not trucks:
+            raise SystemExit("JSON input selected but GOODS_PAYLOAD/TRUCKS_PAYLOAD are empty.")
+    else:
+        items = read_goods(args.goods)
+        trucks = read_trucks(args.trucks)
 
     plans = generate_candidates(items, trucks, count=args.top_k, attempts=args.attempts)
     if not plans:
         raise SystemExit("No loading plan could be generated.")
 
-    print_plan_summary(plans)
+    if args.json_output in ("none", "both"):
+        print_plan_summary(plans)
+    if args.json_output in ("stdout", "both"):
+        print("\nJSON output:")
+        print(json.dumps(plans_to_json(plans), indent=2))
     if args.viz == "none":
         return
 
-    # When requested, preview the two best ranked plans automatically.
-    if args.preview_best_two:
-        to_show = plans[: min(2, len(plans))]
-        for i, (chosen, _unplaced) in enumerate(to_show, start=1):
-            print(f"\nOpening visualization for Plan {i}...")
+    # Auto-preview distinct plans when top-k > 1.
+    # Legacy support: --preview-best-two still forces a two-plan window.
+    if args.top_k > 1 or args.preview_best_two:
+        limit = min(2, len(plans)) if args.preview_best_two else min(args.top_k, len(plans))
+        seen = set()
+        distinct_to_show: List[Tuple[int, List[TruckLoad]]] = []
+        for rank, (candidate_plan, _unplaced) in enumerate(plans[:limit], start=1):
+            sig = plan_preview_signature(candidate_plan)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            distinct_to_show.append((rank, candidate_plan))
+
+        print(f"\nOpening {len(distinct_to_show)} distinct visualization(s) from top {limit} plan(s)...")
+        for rank, chosen in distinct_to_show:
+            balance = format_plan_weight_balance(chosen)
+            print(f"  - Opening visualization for Plan {rank}... {balance}")
             if args.viz == "plotly":
-                visualize_plotly(chosen, plan_label=f"Plan {i}")
+                visualize_plotly(chosen, plan_label=f"Plan {rank}")
             else:
-                visualize_matplotlib(chosen, plan_label=f"Plan {i}")
+                visualize_matplotlib(chosen, plan_label=f"Plan {rank}")
         return
 
     idx = max(1, min(args.plan_index, len(plans))) - 1
     chosen, _unplaced = plans[idx]
+    balance = format_plan_weight_balance(chosen)
+    print(f"  - Opening visualization for Plan {idx + 1}... {balance}")
     if args.viz == "plotly":
         visualize_plotly(chosen, plan_label=f"Plan {idx + 1}")
     else:

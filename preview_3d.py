@@ -32,12 +32,13 @@ def _mesh3d_box_vertices(x0: float, y0: float, z0: float, l: float, b: float, h:
 
 def _placement_hover_lines(p: Dict[str, Any]) -> str:
     name = html.escape(str(p["name"]))
+    truck_id = html.escape(str(p["truck_id"]))
     adr_line = ""
     if p.get("adr", False):
         adr_class = str(p.get("adr_class", "") or "").strip()
         adr_line = f"<br><b>ADR</b> yes{f' (class {html.escape(adr_class)})' if adr_class else ''}"
     return (
-        f"<b>ID {p['ID']}</b><br>{name}<br>"
+        f"<b>ID {p['ID']}</b><br>{truck_id}{name}<br>"
         f"{adr_line}"
         f"<br><b>Dimensions</b> {p['l']:.3f} × {p['b']:.3f} × {p['h']:.3f} m<br>"
         f"<b>Position</b> {p['x']:.3f}, {p['y']:.3f}, {p['z']:.3f} m<br>"
@@ -84,6 +85,67 @@ def _plotly_truck_wireframe_trace(l: float, b: float, h: float) -> Any:
         hoverinfo="skip",
         showlegend=False,
     )
+
+
+def _plotly_weight_balance_traces(
+    l: float,
+    b: float,
+    h: float,
+    front_kg: float,
+    back_kg: float,
+) -> List[Any]:
+    # Draw a bar above the truck (z > h) so it is readable regardless of cargo below.
+    import plotly.graph_objects as go
+
+    bar_z = h + max(0.35, h * 0.18)
+    bar_y = b / 2.0
+    mid = l / 2.0
+    tick = max(0.12, h * 0.06)
+
+    front_trace = go.Scatter3d(
+        x=[0.0, mid],
+        y=[bar_y, bar_y],
+        z=[bar_z, bar_z],
+        mode="lines",
+        line=dict(color="rgba(40, 120, 220, 0.95)", width=12),
+        hoverinfo="skip",
+        showlegend=False,
+        name="Front half",
+    )
+    back_trace = go.Scatter3d(
+        x=[mid, l],
+        y=[bar_y, bar_y],
+        z=[bar_z, bar_z],
+        mode="lines",
+        line=dict(color="rgba(220, 90, 60, 0.95)", width=12),
+        hoverinfo="skip",
+        showlegend=False,
+        name="Back half",
+    )
+    ticks = go.Scatter3d(
+        x=[0.0, 0.0, None, mid, mid, None, l, l],
+        y=[bar_y, bar_y, None, bar_y, bar_y, None, bar_y, bar_y],
+        z=[bar_z - tick, bar_z + tick, None, bar_z - tick, bar_z + tick, None, bar_z - tick, bar_z + tick],
+        mode="lines",
+        line=dict(color="rgba(40,50,70,0.9)", width=4),
+        hoverinfo="skip",
+        showlegend=False,
+    )
+    labels = go.Scatter3d(
+        x=[mid / 2.0, (mid + l) / 2.0],
+        y=[bar_y, bar_y],
+        z=[bar_z + tick * 3.0, bar_z + tick * 3.0],
+        mode="text",
+        text=[
+            f"<b>Front {front_kg:.0f} kg</b>",
+            f"<b>Back {back_kg:.0f} kg</b>",
+        ],
+        textfont=dict(size=16, color="rgb(30,40,60)"),
+        textposition="middle center",
+        hoverinfo="skip",
+        showlegend=False,
+    )
+    return [front_trace, back_trace, ticks, labels]
 
 
 def _plotly_truck_base_trace(l: float, b: float, truck_name: str) -> Any:
@@ -140,7 +202,7 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         cols=cols,
         specs=[[{"type": "scatter3d"} for _ in range(cols)] for _ in range(rows)],
         subplot_titles=tuple(titles),
-        vertical_spacing=0.06,
+        vertical_spacing=0.01,
         horizontal_spacing=0.04,
     )
     fig.update_annotations(font=dict(size=18), yshift=-5)
@@ -152,6 +214,11 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         tl, tb, th = dims["l"], dims["b"], dims["h"]
         fig.add_trace(_plotly_truck_base_trace(tl, tb, plan["truck"]), row=r, col=c)
         fig.add_trace(_plotly_truck_wireframe_trace(tl, tb, th), row=r, col=c)
+
+        front_kg = float(plan.get("front_weight_kg", 0.0))
+        back_kg = float(plan.get("back_weight_kg", 0.0))
+        for trace in _plotly_weight_balance_traces(tl, tb, th, front_kg, back_kg):
+            fig.add_trace(trace, row=r, col=c)
 
         for i, p in enumerate(plan["placements"]):
             vx, vy, vz = _mesh3d_box_vertices(p["x"], p["y"], p["z"], p["l"], p["b"], p["h"])
@@ -182,21 +249,35 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         height=1000 * rows,
     )
 
-    zoom = 0.22
+    zoom = 0.1
     scene_layout: Dict[str, Any] = {}
     for idx, plan in enumerate(plans):
         dims = plan["truck_dims"]
         tl, tb, th = dims["l"], dims["b"], dims["h"]
         sid = "scene" if idx == 0 else f"scene{idx + 1}"
+        z_pad = max(0.9, th * 0.55)
         scene_layout[sid] = dict(
             xaxis=dict(title="Length (m)", range=[0, tl], backgroundcolor="rgb(248,248,248)"),
             yaxis=dict(title="Width (m)", range=[0, tb], backgroundcolor="rgb(248,248,248)"),
-            zaxis=dict(title="Height (m)", range=[0, th], backgroundcolor="rgb(248,248,248)"),
+            zaxis=dict(title="Height (m)", range=[0, th + z_pad], backgroundcolor="rgb(248,248,248)"),
             aspectmode="manual",
-            aspectratio=dict(x=float(tl), y=float(tb), z=float(th)),
+            aspectratio=dict(x=float(tl), y=float(tb), z=float(th) + float(z_pad)),
             camera=dict(eye=dict(x=1.35 / zoom, y=-1.55 / zoom, z=0.85 / zoom)),
         )
     fig.update_layout(**scene_layout)
+
+
+    fig.update_layout(
+            title_text=title,
+            paper_bgcolor="gray",  # Color of the whole canvas
+        )
+
+    fig.update_scenes(
+            xaxis_backgroundcolor="rgba(230, 230, 230, 0.5)",
+            yaxis_backgroundcolor="rgba(230, 230, 230, 0.5)",
+            zaxis_backgroundcolor="rgba(230, 230, 230, 0.5)",
+            bgcolor="white", # Color inside the 3D axes
+        )
     return fig
 
 
@@ -277,9 +358,10 @@ def show_load_preview(
                 alpha=1.0,
             )
             ax.add_collection3d(poly)
+        z_pad = max(0.9, th * 0.55)
         ax.set_xlim(0, tl)
         ax.set_ylim(0, tb)
-        ax.set_zlim(0, th)
+        ax.set_zlim(0, th + z_pad)
         try:
             ax.set_box_aspect((float(tl), float(tb), float(th)))
         except AttributeError:
@@ -287,7 +369,16 @@ def show_load_preview(
         ax.set_xlabel("Length (m)")
         ax.set_ylabel("Width (m)")
         ax.set_zlabel("Height (m)")
-        ax.set_title(plan["truck"])
+        front_kg = float(plan.get("front_weight_kg", 0.0))
+        back_kg = float(plan.get("back_weight_kg", 0.0))
+        ax.set_title(f"{plan['truck']}  |  Front {front_kg:.0f} kg  /  Back {back_kg:.0f} kg")
+        mid_x = tl / 2.0
+        bar_y = tb / 2.0
+        bar_z = th + max(0.35, th * 0.18)
+        ax.plot([0, mid_x], [bar_y, bar_y], [bar_z, bar_z], color="#2878dc", linewidth=3)
+        ax.plot([mid_x, tl], [bar_y, bar_y], [bar_z, bar_z], color="#dc5a3c", linewidth=3)
+        ax.text(mid_x / 2.0, bar_y, bar_z + 0.15, f"Front {front_kg:.0f} kg", color="#2878dc", ha="center")
+        ax.text((mid_x + tl) / 2.0, bar_y, bar_z + 0.15, f"Back {back_kg:.0f} kg", color="#dc5a3c", ha="center")
         ax.view_init(elev=22, azim=-60)
     fig.suptitle(title)
     fig.tight_layout()
