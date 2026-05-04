@@ -48,6 +48,22 @@ def _placement_hover_lines(p: Dict[str, Any]) -> str:
     )
 
 
+def _resolve_segment_weights(plan: Dict[str, Any]) -> List[float]:
+    """Pull the N-segment weight list from a preview-plan dict, with back-compat fallback.
+
+    Newer producers emit ``segment_weights_kg``; older callers may still set the
+    legacy ``front_weight_kg`` / ``back_weight_kg`` fields. If neither is present,
+    return ``[0.0, 0.0]`` so the 2-segment bar still renders with no data.
+    """
+    raw = plan.get("segment_weights_kg")
+    if isinstance(raw, list) and raw:
+        return [float(x) for x in raw]
+    return [
+        float(plan.get("front_weight_kg", 0.0)),
+        float(plan.get("back_weight_kg", 0.0)),
+    ]
+
+
 def _plotly_truck_wireframe_trace(l: float, b: float, h: float) -> Any:
     import plotly.graph_objects as go
 
@@ -87,65 +103,107 @@ def _plotly_truck_wireframe_trace(l: float, b: float, h: float) -> Any:
     )
 
 
+_SEGMENT_PALETTE = [
+    "rgba(40, 120, 220, 0.95)",
+    "rgba(220, 90, 60, 0.95)",
+    "rgba(80, 170, 90, 0.95)",
+    "rgba(180, 120, 60, 0.95)",
+    "rgba(140, 90, 180, 0.95)",
+    "rgba(220, 170, 40, 0.95)",
+    "rgba(60, 170, 200, 0.95)",
+    "rgba(200, 60, 140, 0.95)",
+]
+
+_SEGMENT_PALETTE_MPL = [
+    "#2878dc",
+    "#dc5a3c",
+    "#50aa5a",
+    "#b4783c",
+    "#8c5ab4",
+    "#dcaa28",
+    "#3caac8",
+    "#c83c8c",
+]
+
+
 def _plotly_weight_balance_traces(
     l: float,
     b: float,
     h: float,
-    front_kg: float,
-    back_kg: float,
+    segment_weights: List[float],
+    segment_labels: Optional[List[str]] = None,
 ) -> List[Any]:
-    # Draw a bar above the truck (z > h) so it is readable regardless of cargo below.
+    # Draw a multi-color bar above the truck (z > h) so it is readable regardless of cargo below.
     import plotly.graph_objects as go
 
+    n = max(1, len(segment_weights))
+    if not segment_labels or len(segment_labels) != n:
+        if n == 2:
+            segment_labels = ["Front", "Back"]
+        elif n == 3:
+            segment_labels = ["Front", "Mid", "Back"]
+        else:
+            segment_labels = [f"Seg{i + 1}" for i in range(n)]
+
+    seg_len = l / n
     bar_z = h + max(0.35, h * 0.18)
     bar_y = b / 2.0
-    mid = l / 2.0
     tick = max(0.12, h * 0.06)
 
-    front_trace = go.Scatter3d(
-        x=[0.0, mid],
-        y=[bar_y, bar_y],
-        z=[bar_z, bar_z],
-        mode="lines",
-        line=dict(color="rgba(40, 120, 220, 0.95)", width=12),
-        hoverinfo="skip",
-        showlegend=False,
-        name="Front half",
+    traces: List[Any] = []
+    for i, weight in enumerate(segment_weights):
+        x0 = i * seg_len
+        x1 = l if i == n - 1 else (i + 1) * seg_len
+        color = _SEGMENT_PALETTE[i % len(_SEGMENT_PALETTE)]
+        traces.append(
+            go.Scatter3d(
+                x=[x0, x1],
+                y=[bar_y, bar_y],
+                z=[bar_z, bar_z],
+                mode="lines",
+                line=dict(color=color, width=12),
+                hoverinfo="skip",
+                showlegend=False,
+                name=f"{segment_labels[i]} {weight:.0f} kg",
+            )
+        )
+
+    tick_x: List[Optional[float]] = []
+    tick_y: List[Optional[float]] = []
+    tick_z: List[Optional[float]] = []
+    for i in range(n + 1):
+        x_at = l if i == n else i * seg_len
+        tick_x.extend([x_at, x_at, None])
+        tick_y.extend([bar_y, bar_y, None])
+        tick_z.extend([bar_z - tick, bar_z + tick, None])
+    traces.append(
+        go.Scatter3d(
+            x=tick_x,
+            y=tick_y,
+            z=tick_z,
+            mode="lines",
+            line=dict(color="rgba(40,50,70,0.9)", width=4),
+            hoverinfo="skip",
+            showlegend=False,
+        )
     )
-    back_trace = go.Scatter3d(
-        x=[mid, l],
-        y=[bar_y, bar_y],
-        z=[bar_z, bar_z],
-        mode="lines",
-        line=dict(color="rgba(220, 90, 60, 0.95)", width=12),
-        hoverinfo="skip",
-        showlegend=False,
-        name="Back half",
+
+    label_x = [(i * seg_len + (l if i == n - 1 else (i + 1) * seg_len)) / 2.0 for i in range(n)]
+    label_text = [f"<b>{segment_labels[i]} {segment_weights[i]:.0f} kg</b>" for i in range(n)]
+    traces.append(
+        go.Scatter3d(
+            x=label_x,
+            y=[bar_y] * n,
+            z=[bar_z + tick * 3.0] * n,
+            mode="text",
+            text=label_text,
+            textfont=dict(size=16, color="rgb(30,40,60)"),
+            textposition="middle center",
+            hoverinfo="skip",
+            showlegend=False,
+        )
     )
-    ticks = go.Scatter3d(
-        x=[0.0, 0.0, None, mid, mid, None, l, l],
-        y=[bar_y, bar_y, None, bar_y, bar_y, None, bar_y, bar_y],
-        z=[bar_z - tick, bar_z + tick, None, bar_z - tick, bar_z + tick, None, bar_z - tick, bar_z + tick],
-        mode="lines",
-        line=dict(color="rgba(40,50,70,0.9)", width=4),
-        hoverinfo="skip",
-        showlegend=False,
-    )
-    labels = go.Scatter3d(
-        x=[mid / 2.0, (mid + l) / 2.0],
-        y=[bar_y, bar_y],
-        z=[bar_z + tick * 3.0, bar_z + tick * 3.0],
-        mode="text",
-        text=[
-            f"<b>Front {front_kg:.0f} kg</b>",
-            f"<b>Back {back_kg:.0f} kg</b>",
-        ],
-        textfont=dict(size=16, color="rgb(30,40,60)"),
-        textposition="middle center",
-        hoverinfo="skip",
-        showlegend=False,
-    )
-    return [front_trace, back_trace, ticks, labels]
+    return traces
 
 
 def _plotly_truck_base_trace(l: float, b: float, truck_name: str) -> Any:
@@ -215,9 +273,9 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         fig.add_trace(_plotly_truck_base_trace(tl, tb, plan["truck"]), row=r, col=c)
         fig.add_trace(_plotly_truck_wireframe_trace(tl, tb, th), row=r, col=c)
 
-        front_kg = float(plan.get("front_weight_kg", 0.0))
-        back_kg = float(plan.get("back_weight_kg", 0.0))
-        for trace in _plotly_weight_balance_traces(tl, tb, th, front_kg, back_kg):
+        seg_weights = _resolve_segment_weights(plan)
+        seg_labels = plan.get("segment_labels") or None
+        for trace in _plotly_weight_balance_traces(tl, tb, th, seg_weights, seg_labels):
             fig.add_trace(trace, row=r, col=c)
 
         for i, p in enumerate(plan["placements"]):
@@ -369,16 +427,23 @@ def show_load_preview(
         ax.set_xlabel("Length (m)")
         ax.set_ylabel("Width (m)")
         ax.set_zlabel("Height (m)")
-        front_kg = float(plan.get("front_weight_kg", 0.0))
-        back_kg = float(plan.get("back_weight_kg", 0.0))
-        ax.set_title(f"{plan['truck']}  |  Front {front_kg:.0f} kg  /  Back {back_kg:.0f} kg")
-        mid_x = tl / 2.0
+        seg_weights = _resolve_segment_weights(plan)
+        seg_n = max(1, len(seg_weights))
+        seg_labels = plan.get("segment_labels") or (
+            ["Front", "Back"] if seg_n == 2
+            else (["Front", "Mid", "Back"] if seg_n == 3 else [f"Seg{i + 1}" for i in range(seg_n)])
+        )
+        title_body = "  /  ".join(f"{lbl} {w:.0f} kg" for lbl, w in zip(seg_labels, seg_weights))
+        ax.set_title(f"{plan['truck']}  |  {title_body}")
+        seg_len = tl / seg_n
         bar_y = tb / 2.0
         bar_z = th + max(0.35, th * 0.18)
-        ax.plot([0, mid_x], [bar_y, bar_y], [bar_z, bar_z], color="#2878dc", linewidth=3)
-        ax.plot([mid_x, tl], [bar_y, bar_y], [bar_z, bar_z], color="#dc5a3c", linewidth=3)
-        ax.text(mid_x / 2.0, bar_y, bar_z + 0.15, f"Front {front_kg:.0f} kg", color="#2878dc", ha="center")
-        ax.text((mid_x + tl) / 2.0, bar_y, bar_z + 0.15, f"Back {back_kg:.0f} kg", color="#dc5a3c", ha="center")
+        for i, (lbl, w) in enumerate(zip(seg_labels, seg_weights)):
+            x0 = i * seg_len
+            x1 = tl if i == seg_n - 1 else (i + 1) * seg_len
+            color = _SEGMENT_PALETTE_MPL[i % len(_SEGMENT_PALETTE_MPL)]
+            ax.plot([x0, x1], [bar_y, bar_y], [bar_z, bar_z], color=color, linewidth=3)
+            ax.text((x0 + x1) / 2.0, bar_y, bar_z + 0.15, f"{lbl} {w:.0f} kg", color=color, ha="center")
         ax.view_init(elev=22, azim=-60)
     fig.suptitle(title)
     fig.tight_layout()

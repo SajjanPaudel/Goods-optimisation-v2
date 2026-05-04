@@ -33,15 +33,15 @@ id,truck_id,name,weight_kg,l,b,h,stackable,max_stack,adr,adr_class
 ```
 
 
-| Field           | Meaning                                                                  |
-| --------------- | ------------------------------------------------------------------------ |
-| `l, b, h`       | Length × breadth × height in meters                                      |
-| `weight_kg`     | Weight of the item                                                       |
-| `stackable`     | Can anything be placed on top of it?                                     |
-| `max_stack`     | How many levels high this item can support above itself                  |
-| `adr`           | Dangerous goods flag                                                     |
-| `adr_class`     | Primary hazard label (e.g. `1`, `4.2`, `5.2`, `8`) when `adr=true`       |
-| `adr_class_2`   | Optional subsidiary hazard label (read from CSV/JSON if present)         |
+| Field         | Meaning                                                            |
+| ------------- | ------------------------------------------------------------------ |
+| `l, b, h`     | Length × breadth × height in meters                                |
+| `weight_kg`   | Weight of the item                                                 |
+| `stackable`   | Can anything be placed on top of it?                               |
+| `max_stack`   | How many levels high this item can support above itself            |
+| `adr`         | Dangerous goods flag                                               |
+| `adr_class`   | Primary hazard label (e.g. `1`, `4.2`, `5.2`, `8`) when `adr=true` |
+| `adr_class_2` | Optional subsidiary hazard label (read from CSV/JSON if present)   |
 
 
 An item with `adr=true` contributes its non‑empty primary and subsidiary labels to the
@@ -403,16 +403,16 @@ For a single invocation of `python load_optimizer.py …`:
   runs `pack_once` for seeds `7..N+6`, computes `plan_score`, and dedups.
 4. **Inside each `pack_once`:**
   - Heavy‑first sort, plus 15% adjacent swaps and per‑item rotation shuffle (RNG seeded
-    by the iteration seed).
-   - For each item:
-     - Sort current open trucks by `(used_length, current_weight)`.
-     - For each open truck, check weight, then ADR (`truck_load_accepts_item_adr`), then
-      try `place_item_by_rules` (floor‑in‑frontier → floor‑extend → merged stack → single
-       stack). On success: append the placement, update weight, `used_length`, ADR
-       labels, and rebuild top free rectangles.
-     - If no open truck accepts the item, call `create_new_truck`. If a compatible truck
-      exists, place the item there; otherwise mark it `unplaced`.
-   - When all items are processed, run `optimize_upper_levels` and `compact_truck_load`
+  by the iteration seed).
+  - For each item:
+    - Sort current open trucks by `(used_length, current_weight)`.
+    - For each open truck, check weight, then ADR (`truck_load_accepts_item_adr`), then
+     try `place_item_by_rules` (floor‑in‑frontier → floor‑extend → merged stack → single
+    stack). On success: append the placement, update weight, `used_length`, ADR
+    labels, and rebuild top free rectangles.
+    - If no open truck accepts the item, call `create_new_truck`. If a compatible truck
+     exists, place the item there; otherwise mark it `unplaced`.
+  - When all items are processed, run `optimize_upper_levels` and `compact_truck_load`
     on every truck.
 5. **Rank and trim.** Plans are sorted by `plan_score`, deduplicated, and the top
   `--top-k` are returned.
@@ -439,15 +439,20 @@ Key flags:
 
 - `--goods`, `--trucks` – CSV paths (defaults: `goods_sample.csv`, `trucks_sample.csv`)
 - `--hazard-matrix` – ADR matrix CSV path (default: `hazard.csv`). Required only when
-  some items have `adr=true`; missing matrix file means every ADR pair is rejected.
+some items have `adr=true`; missing matrix file means every ADR pair is rejected.
 - `--top-k` – how many plans to report (default 10)
 - `--attempts` – how many randomized packings to try (default 240)
 - `--input-source json|csv|auto` – read from `GOODS_PAYLOAD` / `TRUCKS_PAYLOAD` instead
-  of CSV. `auto` uses JSON when both payloads are non‑empty, otherwise falls back to CSV.
+of CSV. `auto` uses JSON when both payloads are non‑empty, otherwise falls back to CSV.
 - `--json-output none|stdout|both` – also emit the structured JSON result
 - `--viz plotly|matplotlib|none` – 3D preview backend (default: plotly)
 - `--plan-index N` – which plan to visualize when `--top-k 1`
 - `--preview-best-two` – legacy flag forcing visualization of plans 1 and 2
+- `--weight-segments N` – split each truck's weight report into `N` equal‑length
+x‑axis bins (default `2` = front/back). `N=1` reports the whole truck as one
+segment, `N=3` labels them `Front / Mid / Back`, `N≥4` uses `Seg1 … SegN`. The
+same N drives the colored bar drawn above each truck in the 3D preview and the
+per‑truck `weight_segments` array in the JSON output.
 
 Typical text output (abbreviated, with sample ADR mix from `goods_sample.csv`):
 
@@ -469,10 +474,16 @@ and per‑placement `adr_class` / `adr_class_2`.
 ## 11. 3D preview
 
 `preview_3d.py` renders each truck as a wireframe with colored mesh boxes for placed
-items. ADR items show a hover line `ADR yes (class X)`. The Plotly subplot height is
-`1500 px × number_of_trucks`, and the camera zoom is `0.10` — both tuned to keep multi‑
-truck plans readable without manual rotation. Pass `use_matplotlib=True` (or `--viz
-matplotlib`) for a static PNG‑style preview.
+items. ADR items show a hover line `ADR yes (class X)`. Above the truck a horizontal
+bar is drawn at `z = h + max(0.35, 0.18·h)`, split into `--weight-segments N` colored
+intervals along `x`; each interval is labeled `<name> <kg>` (e.g. `Front 970 kg`,
+`Back 470 kg`, or `Seg1 446 kg … Seg5 120 kg`). Per‑item weights are split
+proportionally to how the item's footprint overlaps each bin (`truck_segment_weights`),
+so an item that straddles two bins contributes its weight to both in proportion to its
+length share — and `sum(segments) == sum(item_weights)` exactly, even with non‑round
+`L/N`. The Plotly subplot height is `1500 px × number_of_trucks`, and the camera zoom
+is `0.10`. Pass `use_matplotlib=True` (or `--viz matplotlib`) for a static PNG‑style
+preview, which uses the same N‑segment bar.
 
 ---
 
@@ -495,5 +506,8 @@ matplotlib`) for a static PNG‑style preview.
 | Generate and rank plans       | `generate_candidates`, `plan_score`                                                                                                                |
 | Post‑optimize a truck         | `optimize_upper_levels`, `compact_truck_load`                                                                                                      |
 | Convert a plan to JSON / dict | `plans_to_json`, `plan_to_preview_dicts`, `plan_preview_signature`                                                                                 |
-| 3D rendering                  | `visualize_plotly`, `visualize_matplotlib` (in `preview_3d.py`)                                                                                    |
+| Split weight along x          | `truck_segment_weights` (N‑bin generic), `truck_front_back_weights` (back‑compat shim), `_segment_labels`                                          |
+| Format the balance text line  | `format_plan_weight_balance`                                                                                                                       |
+| 3D rendering                  | `visualize_plotly`, `visualize_matplotlib` (in `preview_3d.py`); bar traces in `_plotly_weight_balance_traces`                                     |
+
 

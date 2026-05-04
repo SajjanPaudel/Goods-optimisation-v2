@@ -148,11 +148,10 @@ def load_adr_matrix(csv_path: str | Path = "hazard.csv") -> AdrMatrix:
 
 
 def adr_pair_allowed(matrix: AdrMatrix, label1: str, label2: str) -> bool:
-    # Rule 2 from the original Delphi script: a pair is allowed only if the
+    # Rule 2 : An ADR pair is allowed only if the
     # matrix value is 1 or 9. Missing entries are treated as forbidden, matching
     # the original initialisation of bNotAllowed = TRUE.
     a, b = (label1 or "").strip(), (label2 or "").strip()
-    print(f"label1 is: {a}, label2 is: {b}")
     if not a or not b:
         return True
     val = matrix.get((a, b))
@@ -181,7 +180,7 @@ def _classify_labels(labels: Iterable[str]) -> Tuple[bool, bool, bool, bool]:
 
 
 def adr_class_mix_allowed(labels: Iterable[str]) -> bool:
-    # Rule 1 from the original Delphi script: forbid (class 1 + 5.2 + other)
+    # Rule 1 : Forbid (class 1 + 5.2 + other)
     # or (class 1 + 4.2 + other) on the same truck.
     c1, c52, c42, cother = _classify_labels(labels)
     if c1 and c52 and cother:
@@ -1279,29 +1278,45 @@ def largest_contiguous_air_area(truck: TruckLoad) -> float:
             best = max(best, l * w)
     return best
 
+def truck_segment_weights(truck: TruckLoad, n: int) -> List[float]:
+    """Split each item's weight proportionally across n equal-length x-bins."""
+    n = max(1, int(n))
+    L = truck.truck_type.l
+    seg = L / n
+    weights = [0.0] * n
+    for p in truck.placements:
+        if p.l <= 0 or seg <= 0:
+            continue
+        for i in range(n):
+            lo = i * seg
+            hi = L if i == n - 1 else (i + 1) * seg
+            span = max(0.0, min(p.x2, hi) - max(p.x, lo))
+            if span <= 0:
+                continue
+            weights[i] += p.item.weight * (span / p.l)
+    return weights
 
 def truck_front_back_weights(truck: TruckLoad) -> Tuple[float, float]:
-    # Split each item's weight proportionally across the truck's length midpoint.
-    mid = truck.truck_type.l / 2.0
-    front = 0.0
-    back = 0.0
-    for p in truck.placements:
-        if p.l <= 0:
-            continue
-        front_span = max(0.0, min(p.x2, mid) - p.x)
-        front_ratio = max(0.0, min(1.0, front_span / p.l))
-        front += p.item.weight * front_ratio
-        back += p.item.weight * (1.0 - front_ratio)
-    return front, back
+    a, b = truck_segment_weights(truck, 2)
+    return a, b
 
 
-def format_plan_weight_balance(plan: List[TruckLoad]) -> str:
+def format_plan_weight_balance(plan: List[TruckLoad], segments: int = 2) -> str:
     parts: List[str] = []
+    labels = _segment_labels(segments)  # ["Front", "Back"], or ["Seg1", "Seg2", "Seg3"], etc.
     for truck in plan:
-        front, back = truck_front_back_weights(truck)
-        parts.append(f"{truck.truck_type.truck_id} Front {front:.0f}kg Back {back:.0f}kg")
+        ws = truck_segment_weights(truck, segments)
+        body = " ".join(f"{lbl} {w:.0f}kg" for lbl, w in zip(labels, ws))
+        parts.append(f"{truck.truck_type.truck_id} {body}")
     return " | ".join(parts)
 
+
+def _segment_labels(n: int) -> List[str]:
+    if n == 2:
+        return ["Front", "Back"]
+    if n == 3:
+        return ["Front", "Mid", "Back"]
+    return [f"Seg{i+1}" for i in range(n)]
 
 def plan_contiguous_space_metrics(trucks: List[TruckLoad]) -> Tuple[float, float]:
     floor_best = max((largest_contiguous_floor_area(t) for t in trucks), default=0.0)
@@ -1393,7 +1408,12 @@ def print_plan_summary(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> None:
                 )
 
 
-def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, Any]:
+def plans_to_json(
+    plans: List[Tuple[List[TruckLoad], List[Item]]],
+    segments: int = 2,
+) -> Dict[str, Any]:
+    seg_n = max(1, int(segments))
+    seg_labels = _segment_labels(seg_n)
     payload: Dict[str, Any] = {"plans": []}
     for idx, (plan, unplaced) in enumerate(plans, start=1):
         total_remaining, floor_remaining, air_remaining = plan_remaining_usable_volume(plan)
@@ -1416,6 +1436,8 @@ def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, 
                         "adr_class_2": p.item.adr_class_2,
                     }
                 )
+            seg_weights = truck_segment_weights(truck, seg_n)
+            seg_length = truck.truck_type.l / seg_n if seg_n > 0 else 0.0
             trucks_out.append(
                 {
                     "truck_id": truck.truck_type.truck_id,
@@ -1426,6 +1448,15 @@ def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, 
                     "used_length_m": truck.used_length,
                     "items_count": len(truck.placements),
                     "adr_labels_loaded": sorted(truck.adr_labels),
+                    "weight_segments": [
+                        {
+                            "label": label,
+                            "x_start_m": i * seg_length,
+                            "x_end_m": truck.truck_type.l if i == seg_n - 1 else (i + 1) * seg_length,
+                            "weight_kg": w,
+                        }
+                        for i, (label, w) in enumerate(zip(seg_labels, seg_weights))
+                    ],
                     "placements": placements,
                 }
             )
@@ -1464,7 +1495,9 @@ def plans_to_json(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> Dict[str, 
     return payload
 
 
-def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
+def plan_to_preview_dicts(plan: List[TruckLoad], segments: int = 2) -> List[Dict[str, Any]]:
+    seg_n = max(1, int(segments))
+    seg_labels = _segment_labels(seg_n)
     preview_plans: List[Dict[str, Any]] = []
     for truck in plan:
         placements = []
@@ -1487,15 +1520,16 @@ def plan_to_preview_dicts(plan: List[TruckLoad]) -> List[Dict[str, Any]]:
                     "adr_class_2": p.item.adr_class_2,
                 }
             )
-        front_weight, back_weight = truck_front_back_weights(truck)
+        segment_weights = truck_segment_weights(truck, seg_n)
         preview_plans.append(
             {
                 "truck": truck.truck_type.truck_id,
                 "truck_dims": {"l": truck.truck_type.l, "b": truck.truck_type.w, "h": truck.truck_type.h},
                 "placed_count": len(placements),
                 "weight_util_pct": (truck.current_weight / truck.truck_type.max_weight * 100.0) if truck.truck_type.max_weight > 0 else 0.0,
-                "front_weight_kg": front_weight,
-                "back_weight_kg": back_weight,
+                "segment_weights_kg": segment_weights,
+                "segment_labels": seg_labels,
+                "segment_count": len(segment_weights),
                 "placements": placements,
             }
         )
@@ -1524,21 +1558,21 @@ def plan_preview_signature(plan: List[TruckLoad]) -> Tuple[Any, ...]:
     return tuple(truck_sigs)
 
 
-def visualize_plotly(plan: List[TruckLoad], plan_label: str = "Plan") -> None:
+def visualize_plotly(plan: List[TruckLoad], plan_label: str = "Plan", segments: int = 2) -> None:
     import preview_3d
 
     preview_3d.show_load_preview(
-        plan_to_preview_dicts(plan),
+        plan_to_preview_dicts(plan, segments=segments),
         use_matplotlib=False,
         title=plan_label,
     )
 
 
-def visualize_matplotlib(plan: List[TruckLoad], plan_label: str = "Plan") -> None:
+def visualize_matplotlib(plan: List[TruckLoad], plan_label: str = "Plan", segments: int = 2) -> None:
     import preview_3d
 
     preview_3d.show_load_preview(
-        plan_to_preview_dicts(plan),
+        plan_to_preview_dicts(plan, segments=segments),
         use_matplotlib=True,
         title=plan_label,
     )
@@ -1574,6 +1608,12 @@ def main() -> None:
         action="store_true",
         help="Automatically visualize plan 1 and 2 (if available).",
     )
+    parser.add_argument(
+        "--weight-segments",
+        type=int,
+        default=2,
+        help="Number of equal-length x-axis bins to report per-truck weight totals for (default: 2 = front/back).",
+    )
     args = parser.parse_args()
 
     global ADR_MATRIX_PATH
@@ -1600,11 +1640,13 @@ def main() -> None:
     if not plans:
         raise SystemExit("No loading plan could be generated.")
 
+    seg_n = max(1, int(args.weight_segments))
+
     if args.json_output in ("none", "both"):
         print_plan_summary(plans)
     if args.json_output in ("stdout", "both"):
         print("\nJSON output:")
-        print(json.dumps(plans_to_json(plans), indent=2))
+        print(json.dumps(plans_to_json(plans, segments=seg_n), indent=2))
     if args.viz == "none":
         return
 
@@ -1623,22 +1665,22 @@ def main() -> None:
 
         print(f"\nOpening {len(distinct_to_show)} distinct visualization(s) from top {limit} plan(s)...")
         for rank, chosen in distinct_to_show:
-            balance = format_plan_weight_balance(chosen)
+            balance = format_plan_weight_balance(chosen, segments=seg_n)
             print(f"  - Opening visualization for Plan {rank}... {balance}")
             if args.viz == "plotly":
-                visualize_plotly(chosen, plan_label=f"Plan {rank}")
+                visualize_plotly(chosen, plan_label=f"Plan {rank}", segments=seg_n)
             else:
-                visualize_matplotlib(chosen, plan_label=f"Plan {rank}")
+                visualize_matplotlib(chosen, plan_label=f"Plan {rank}", segments=seg_n)
         return
 
     idx = max(1, min(args.plan_index, len(plans))) - 1
     chosen, _unplaced = plans[idx]
-    balance = format_plan_weight_balance(chosen)
+    balance = format_plan_weight_balance(chosen, segments=seg_n)
     print(f"  - Opening visualization for Plan {idx + 1}... {balance}")
     if args.viz == "plotly":
-        visualize_plotly(chosen, plan_label=f"Plan {idx + 1}")
+        visualize_plotly(chosen, plan_label=f"Plan {idx + 1}", segments=seg_n)
     else:
-        visualize_matplotlib(chosen, plan_label=f"Plan {idx + 1}")
+        visualize_matplotlib(chosen, plan_label=f"Plan {idx + 1}", segments=seg_n)
 
 
 if __name__ == "__main__":
