@@ -46,6 +46,16 @@ TRUCKS_PAYLOAD: Dict[str, Any] = {
 # Allow small height mismatch when treating support surfaces as coplanar.
 Z_COPLANAR_TOL = 1e-7
 
+# Stacking: fraction of the candidate's footprint (l×w) that must rest on
+# coplanar support (real cargo or pre-occupied synthetic placement tops).
+MIN_STACK_FOOTPRINT_SUPPORT_RATIO = 0.7
+# Connected component under footprint centre must cover at least this fraction
+# of the footprint (reduces unstable “bridged” stacks).
+MIN_STACK_CONTIGUOUS_FOOTPRINT_RATIO = 0.7
+# When total footprint support meets this *stricter* threshold, allow stacking
+# across disjoint support patches (e.g. cargo deck + obstacle top with a gap).
+MIN_STACK_BRIDGE_TOTAL_SUPPORT_RATIO = 0.7
+
 
 @dataclass
 class Item:
@@ -105,6 +115,22 @@ class TruckType:
     w: float
     h: float
     max_weight: float
+    pre_l: float = 0.0
+    pre_w: float = 0.0
+    pre_h: float = 0.0
+    pre_x: float = 0.0
+    pre_y: float = 0.0
+    pre_z: float = 0.0
+
+    @property
+    def has_pre_occupied(self) -> bool:
+        return self.pre_l > 1e-9 and self.pre_w > 1e-9 and self.pre_h > 1e-9
+
+    def pre_occupied_box(self) -> Optional[Tuple[float, float, float, float, float, float]]:
+        # (x, y, z, l, w, h) of the pre-occupied volume, or None if not set.
+        if not self.has_pre_occupied:
+            return None
+        return (self.pre_x, self.pre_y, self.pre_z, self.pre_l, self.pre_w, self.pre_h)
 
 
 # ADR pairwise segregation matrix, mirrors OWN_Combined_ADRLoad.
@@ -224,6 +250,9 @@ def truck_load_accepts_item_adr(
 ADR_MATRIX_PATH: str = "hazard.csv"
 
 
+PRE_OCCUPIED_ITEM_ID = "__PRE_OCCUPIED__"
+
+
 @dataclass
 class Placement:
     item: Item
@@ -237,6 +266,7 @@ class Placement:
     base_item_indices: List[int] = field(default_factory=list)
     stack_level: int = 0
     top_free_rects: List[Tuple[float, float, float, float]] = field(default_factory=list)
+    is_pre_occupied: bool = False
 
     @property
     def x2(self) -> float:
@@ -266,6 +296,52 @@ class TruckLoad:
     def __post_init__(self) -> None:
         if not self.free_rects:
             self.free_rects = [(0.0, 0.0, self.truck_type.l, self.truck_type.w)]
+        # Register the pre-occupied volume as a synthetic floor placement so
+        # all the existing collision / stacking machinery sees it: items
+        # cannot be placed inside it, but its top face may be used as a
+        # coplanar base for stacking. The matching floor footprint is also
+        # carved out of the free-rect pool so floor placement never targets
+        # that region.
+        box = self.truck_type.pre_occupied_box()
+        if box is None:
+            return
+        px, py, pz, pl, pw, ph = box
+        if pz <= 1e-6:
+            cut = (px, py, pl, pw)
+            next_rects: List[Tuple[float, float, float, float]] = []
+            for rect in self.free_rects:
+                next_rects.extend(subtract_rect(rect, cut))
+            self.free_rects = merge_free_rectangles(next_rects)
+        synthetic_item = Item(
+            item_id=PRE_OCCUPIED_ITEM_ID,
+            truck_id=self.truck_type.truck_id,
+            name="Pre-occupied",
+            weight=0.0,
+            l=pl,
+            w=pw,
+            h=ph,
+            stackable=True,
+            max_stack=10**6,
+            adr=False,
+            adr_class="",
+            adr_class_2="",
+        )
+        self.placements.append(
+            Placement(
+                item=synthetic_item,
+                x=px,
+                y=py,
+                z=pz,
+                l=pl,
+                w=pw,
+                h=ph,
+                truck_idx=-1,
+                base_item_indices=[],
+                stack_level=0,
+                top_free_rects=[(0.0, 0.0, pl, pw)],
+                is_pre_occupied=True,
+            )
+        )
 
 
 def parse_items_from_json(payload: Dict[str, Any]) -> List[Item]:
@@ -289,17 +365,52 @@ def parse_items_from_json(payload: Dict[str, Any]) -> List[Item]:
     return items
 
 
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        text = str(value).strip()
+    except Exception:
+        return default
+    if not text:
+        return default
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_pre_occupied(row: Dict[str, Any], truck_h: float) -> Tuple[float, float, float, float, float, float]:
+    # Column names are tolerated case-insensitively and with extra whitespace.
+    norm = {(k or "").strip().lower(): v for k, v in row.items() if k}
+    pre_l = _coerce_float(norm.get("pre_occupied_space_l"))
+    pre_w = _coerce_float(norm.get("pre_occupied_space_b"))
+    pre_h = _coerce_float(norm.get("pre_occupied_space_h"), default=truck_h if pre_l > 0 and pre_w > 0 else 0.0)
+    pre_x = _coerce_float(norm.get("preoccupied_position_x"))
+    pre_y = _coerce_float(norm.get("preoccupied_position_y"))
+    pre_z = _coerce_float(norm.get("preoccupied_position_z"))
+    return pre_l, pre_w, pre_h, pre_x, pre_y, pre_z
+
+
 def parse_trucks_from_json(payload: Dict[str, Any]) -> List[TruckType]:
     trucks: List[TruckType] = []
     for row in payload.get("trucks", []):
+        truck_h = float(row["h"])
+        pre_l, pre_w, pre_h, pre_x, pre_y, pre_z = _resolve_pre_occupied(row, truck_h)
         trucks.append(
             TruckType(
                 truck_id=str(row["id"]),
                 name=str(row.get("name", "")),
                 l=float(row["l"]),
                 w=float(row["b"]),
-                h=float(row["h"]),
+                h=truck_h,
                 max_weight=float(row["max_weight_kg"]),
+                pre_l=pre_l,
+                pre_w=pre_w,
+                pre_h=pre_h,
+                pre_x=pre_x,
+                pre_y=pre_y,
+                pre_z=pre_z,
             )
         )
     trucks.sort(key=lambda t: (t.l, t.w * t.h, t.max_weight), reverse=True)
@@ -335,14 +446,22 @@ def read_trucks(path: str) -> List[TruckType]:
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            truck_h = float(row["h"])
+            pre_l, pre_w, pre_h, pre_x, pre_y, pre_z = _resolve_pre_occupied(row, truck_h)
             trucks.append(
                 TruckType(
                     truck_id=row["id"],
                     name=row.get("name", ""),
                     l=float(row["l"]),
                     w=float(row["b"]),
-                    h=float(row["h"]),
+                    h=truck_h,
                     max_weight=float(row["max_weight_kg"]),
+                    pre_l=pre_l,
+                    pre_w=pre_w,
+                    pre_h=pre_h,
+                    pre_x=pre_x,
+                    pre_y=pre_y,
+                    pre_z=pre_z,
                 )
             )
     # Prefer longer trucks first; this reduces split loads for long freight.
@@ -578,6 +697,10 @@ def base_supports_stack(truck: TruckLoad, base_indices: List[int]) -> bool:
 def base_supports_weight_limit(truck: TruckLoad, base_indices: List[int], stacked_item_weight: float) -> bool:
     if not base_indices:
         return True
+    # Pre-occupied bases are treated as fixed structure with effectively
+    # unlimited carrying capacity, so anything sitting on them is OK.
+    if any(truck.placements[idx].is_pre_occupied for idx in base_indices):
+        return True
     base_weight_sum = sum(truck.placements[idx].item.weight for idx in base_indices)
     return stacked_item_weight <= base_weight_sum + 1e-9
 
@@ -591,10 +714,22 @@ def can_place(
     w: float,
     h: float,
     item_weight: float = 0.0,
-    min_support_ratio: float = 0.98,
+    min_support_ratio: float = MIN_STACK_FOOTPRINT_SUPPORT_RATIO,
 ) -> Tuple[bool, List[int]]:
     if not within_truck(truck, x, y, z, l, w, h):
         return False, []
+    box = truck.truck_type.pre_occupied_box()
+    if box is not None:
+        bx, by, bz, bl, bw, bh = box
+        if not (
+            x + l <= bx + 1e-9
+            or bx + bl <= x + 1e-9
+            or y + w <= by + 1e-9
+            or by + bw <= y + 1e-9
+            or z + h <= bz + 1e-9
+            or bz + bh <= z + 1e-9
+        ):
+            return False, []
     for p in truck.placements:
         if overlap_3d(p, x, y, z, l, w, h):
             return False, []
@@ -602,7 +737,8 @@ def can_place(
     if ratio < min_support_ratio:
         return False, []
     if z > 0:
-        if contiguous_support_ratio(truck, x, y, z, l, w) < 0.75:
+        conn = contiguous_support_ratio(truck, x, y, z, l, w)
+        if conn < MIN_STACK_CONTIGUOUS_FOOTPRINT_RATIO and ratio < MIN_STACK_BRIDGE_TOTAL_SUPPORT_RATIO:
             return False, []
         if not base_supports_stack(truck, base_indices):
             return False, []
@@ -790,13 +926,116 @@ def rebuild_top_free_rects(truck: TruckLoad, eps: float = 1e-4) -> None:
         base.top_free_rects = rects
 
 
+def _collect_stack_planes(truck: TruckLoad) -> List[float]:
+    """Distinct horizontal support heights (placement tops) below the truck roof."""
+    planes: List[float] = []
+    for p in truck.placements:
+        zt = p.z2
+        if zt >= truck.truck_type.h - 1e-9:
+            continue
+        if not any(abs(zt - zp) <= Z_COPLANAR_TOL for zp in planes):
+            planes.append(zt)
+    return sorted(planes)
+
+
+def _candidate_xy_partial_stack(
+    truck: TruckLoad,
+    stack_z: float,
+    il: float,
+    iw: float,
+) -> Tuple[List[float], List[float]]:
+    """Discrete (x, y) origins that align item edges to support edges at ``stack_z``.
+
+    Allows overhang / air gap under part of the footprint; feasibility is still
+    enforced by ``can_place`` (footprint support ratio and contiguous rules).
+    """
+    L = truck.truck_type.l
+    W = truck.truck_type.w
+    if il > L + 1e-9 or iw > W + 1e-9:
+        return [], []
+    hi_x = max(0.0, L - il)
+    hi_y = max(0.0, W - iw)
+    xs: Set[float] = {0.0, hi_x}
+    ys: Set[float] = {0.0, hi_y}
+    for p in truck.placements:
+        if abs(p.z2 - stack_z) > Z_COPLANAR_TOL:
+            continue
+        for xv in (p.x, p.x2 - il):
+            xs.add(max(0.0, min(float(xv), hi_x)))
+        for yv in (p.y, p.y2 - iw):
+            ys.add(max(0.0, min(float(yv), hi_y)))
+    return sorted(xs), sorted(ys)
+
+
+def try_stack_partial_support(
+    item: Item,
+    truck: TruckLoad,
+    rotations: Optional[List[Tuple[float, float, float]]] = None,
+    plane_filter: Optional[Any] = None,
+) -> Optional[Placement]:
+    """Stack with possible overhang if coplanar support still meets ratio rules.
+
+    Unlike ``try_stack_single_base``, the footprint need not fit inside one
+    ``top_free_rect``; support may come from several adjacent tops or a subset
+    of the obstacle deck with deliberate air gap, as long as ``can_place`` accepts it.
+
+    If ``plane_filter`` is set, only support heights ``stack_z`` for which
+    ``plane_filter(stack_z)`` is true are considered (e.g. pre-occupied deck only).
+    """
+    rots = rotations if rotations is not None else item.rotations_xy()
+    best: Optional[Tuple[Tuple[float, float, float, float, float], Placement]] = None
+    for stack_z in _collect_stack_planes(truck):
+        if plane_filter is not None and not plane_filter(stack_z):
+            continue
+        for il, iw, ih in rots:
+            if stack_z + ih > truck.truck_type.h + 1e-9:
+                continue
+            xs, ys = _candidate_xy_partial_stack(truck, stack_z, il, iw)
+            if not xs or not ys:
+                continue
+            for x in xs:
+                for y in ys:
+                    ok, base_indices = can_place(
+                        truck,
+                        x,
+                        y,
+                        stack_z,
+                        il,
+                        iw,
+                        ih,
+                        item_weight=item.weight,
+                    )
+                    if not ok:
+                        continue
+                    placement = Placement(
+                        item=item,
+                        x=x,
+                        y=y,
+                        z=stack_z,
+                        l=il,
+                        w=iw,
+                        h=ih,
+                        truck_idx=-1,
+                        base_item_indices=base_indices,
+                        stack_level=placement_stack_level(truck, base_indices),
+                        top_free_rects=[(0.0, 0.0, il, iw)],
+                    )
+                    score = stack_score(placement, truck)
+                    if best is None or score < best[0]:
+                        best = (score, placement)
+    return None if best is None else best[1]
+
+
 def try_stack_single_base(
     item: Item,
     truck: TruckLoad,
     rotations: Optional[List[Tuple[float, float, float]]] = None,
+    base_filter: Optional[Any] = None,
 ) -> Optional[Placement]:
     best: Optional[Tuple[Tuple[float, float, float, float, float], Placement]] = None
     for base_idx, base in enumerate(sorted(truck.placements, key=lambda p: (p.x, p.y, p.z))):
+        if base_filter is not None and not base_filter(base):
+            continue
         if not base.item.stackable:
             continue
         if base.stack_level + 1 >= base.item.max_stack:
@@ -926,12 +1165,68 @@ def placement_stack_level(truck: TruckLoad, base_indices: List[int]) -> int:
     return 1 + max(truck.placements[idx].stack_level for idx in base_indices)
 
 
+def _pre_void_starts_at_truck_front(tt: TruckType, eps: float = 1e-6) -> bool:
+    """True if the no-floor region touches the nose (low x); deck on top is forward cargo space."""
+    box = tt.pre_occupied_box()
+    if box is None:
+        return False
+    px = box[0]
+    return px <= eps
+
+
+def _partial_plane_over_front_void(truck: TruckLoad, deck_z: float, box: Tuple[float, float, float, float, float, float]) -> Any:
+    """Allow partial stacking on the void deck surface and on cargo tops that overlap the void footprint."""
+
+    def ok(sz: float) -> bool:
+        if abs(sz - deck_z) <= Z_COPLANAR_TOL:
+            return True
+        px, py, _pz, pl, pw, _ph = box
+        vx1, vy1, vx2, vy2 = px, py, px + pl, py + pw
+        for p in truck.placements:
+            if abs(p.z2 - sz) > Z_COPLANAR_TOL:
+                continue
+            if p.x < vx2 - 1e-9 and p.x2 > vx1 + 1e-9 and p.y < vy2 - 1e-9 and p.y2 > vy1 + 1e-9:
+                return True
+        return False
+
+    return ok
+
+
 def place_item_by_rules(
     item: Item,
     truck: TruckLoad,
     remaining_items: Optional[List[Item]] = None,
     rotations: Optional[List[Tuple[float, float, float]]] = None,
 ) -> Optional[Placement]:
+    rebuild_top_free_rects(truck)
+
+    tt = truck.truck_type
+    front_void = _pre_void_starts_at_truck_front(tt)
+
+    # Irregular bed void at the nose: usable deck is on top of the fixed volume.
+    # Offer that surface before jumping to open floor behind the void (high x).
+    if front_void:
+        box_po = tt.pre_occupied_box()
+        deck_z = box_po[2] + box_po[5]
+        pre_top = try_stack_single_base(
+            item,
+            truck,
+            rotations=rotations,
+            base_filter=lambda base: base.is_pre_occupied,
+        )
+        if pre_top is not None:
+            return pre_top
+
+        partial_stack = try_stack_partial_support(
+            item,
+            truck,
+            rotations=rotations,
+            plane_filter=_partial_plane_over_front_void(truck, deck_z, box_po),
+        )
+        if partial_stack is not None:
+            return partial_stack
+
+    # Open floor along usable length (front to back where floor exists).
     floor_frontier_x = truck.used_length if truck.placements else None
     floor_fit = try_place_on_floor(
         item,
@@ -961,6 +1256,21 @@ def place_item_by_rules(
     single_stack = try_stack_single_base(item, truck, rotations=rotations)
     if single_stack is not None:
         return single_stack
+
+    # Rear / inset void: deck-over-fixed-volume only after floor + normal stacks.
+    if not front_void:
+        pre_top = try_stack_single_base(
+            item,
+            truck,
+            rotations=rotations,
+            base_filter=lambda base: base.is_pre_occupied,
+        )
+        if pre_top is not None:
+            return pre_top
+
+        partial_stack = try_stack_partial_support(item, truck, rotations=rotations)
+        if partial_stack is not None:
+            return partial_stack
     return None
 
 
@@ -1088,6 +1398,8 @@ def compact_truck_load(truck: TruckLoad) -> None:
             reverse=True,
         )
         for group in groups:
+            if any(truck.placements[i].is_pre_occupied for i in group):
+                continue
             left_bound = -min(truck.placements[i].x for i in group)
             if left_bound >= -1e-9:
                 continue
@@ -1259,8 +1571,11 @@ def plan_volume_usage(trucks: List[TruckLoad]) -> Tuple[float, float, float]:
     used = 0.0
     capacity = 0.0
     for t in trucks:
-        used += sum(p.l * p.w * p.h for p in t.placements)
-        capacity += t.truck_type.l * t.truck_type.w * t.truck_type.h
+        used += sum(p.l * p.w * p.h for p in t.placements if not p.is_pre_occupied)
+        pre_volume = sum(
+            p.l * p.w * p.h for p in t.placements if p.is_pre_occupied
+        )
+        capacity += t.truck_type.l * t.truck_type.w * t.truck_type.h - pre_volume
     utilization = (used / capacity) if capacity > 1e-9 else 0.0
     return used, capacity, utilization
 
@@ -1386,12 +1701,13 @@ def print_plan_summary(plans: List[Tuple[List[TruckLoad], List[Item]]]) -> None:
             f"total_used_length={score[9]:.2f}m total_weight={score[10]:.1f}kg"
         )
         for t_idx, truck in enumerate(plan):
+            real_placements = [p for p in truck.placements if not p.is_pre_occupied]
             print(
                 f"  Truck {t_idx + 1} ({truck.truck_type.truck_id}): "
-                f"items={len(truck.placements)} weight={truck.current_weight:.1f}kg "
+                f"items={len(real_placements)} weight={truck.current_weight:.1f}kg "
                 f"used_length={truck.used_length:.2f}m"
             )
-            for p in sorted(truck.placements, key=lambda pl: (pl.x, pl.y, pl.z, pl.item.item_id)):
+            for p in sorted(real_placements, key=lambda pl: (pl.x, pl.y, pl.z, pl.item.item_id)):
                 print(
                     f"    - ID {p.item.item_id} ({p.item.name}) "
                     f"pos=({p.x:.2f},{p.y:.2f},{p.z:.2f}) "
@@ -1422,7 +1738,8 @@ def plans_to_json(
         trucks_out = []
         for truck in plan:
             placements = []
-            for p in sorted(truck.placements, key=lambda pl: (pl.x, pl.y, pl.z, pl.item.item_id)):
+            real_placements = [p for p in truck.placements if not p.is_pre_occupied]
+            for p in sorted(real_placements, key=lambda pl: (pl.x, pl.y, pl.z, pl.item.item_id)):
                 placements.append(
                     {
                         "id": p.item.item_id,
@@ -1446,7 +1763,7 @@ def plans_to_json(
                     "max_weight_kg": truck.truck_type.max_weight,
                     "weight_used_kg": truck.current_weight,
                     "used_length_m": truck.used_length,
-                    "items_count": len(truck.placements),
+                    "items_count": len(real_placements),
                     "adr_labels_loaded": sorted(truck.adr_labels),
                     "weight_segments": [
                         {
@@ -1501,7 +1818,8 @@ def plan_to_preview_dicts(plan: List[TruckLoad], segments: int = 2) -> List[Dict
     preview_plans: List[Dict[str, Any]] = []
     for truck in plan:
         placements = []
-        for p in sorted(truck.placements, key=lambda pl: (pl.x, pl.y, pl.z, pl.item.item_id)):
+        real_placements = [p for p in truck.placements if not p.is_pre_occupied]
+        for p in sorted(real_placements, key=lambda pl: (pl.x, pl.y, pl.z, pl.item.item_id)):
             placements.append(
                 {
                     "ID": int(p.item.item_id),
@@ -1521,18 +1839,24 @@ def plan_to_preview_dicts(plan: List[TruckLoad], segments: int = 2) -> List[Dict
                 }
             )
         segment_weights = truck_segment_weights(truck, seg_n)
-        preview_plans.append(
-            {
-                "truck": truck.truck_type.truck_id,
-                "truck_dims": {"l": truck.truck_type.l, "b": truck.truck_type.w, "h": truck.truck_type.h},
-                "placed_count": len(placements),
-                "weight_util_pct": (truck.current_weight / truck.truck_type.max_weight * 100.0) if truck.truck_type.max_weight > 0 else 0.0,
-                "segment_weights_kg": segment_weights,
-                "segment_labels": seg_labels,
-                "segment_count": len(segment_weights),
-                "placements": placements,
+        plan_dict: Dict[str, Any] = {
+            "truck": truck.truck_type.truck_id,
+            "truck_dims": {"l": truck.truck_type.l, "b": truck.truck_type.w, "h": truck.truck_type.h},
+            "placed_count": len(placements),
+            "weight_util_pct": (truck.current_weight / truck.truck_type.max_weight * 100.0) if truck.truck_type.max_weight > 0 else 0.0,
+            "segment_weights_kg": segment_weights,
+            "segment_labels": seg_labels,
+            "segment_count": len(segment_weights),
+            "placements": placements,
+        }
+        pre_box = truck.truck_type.pre_occupied_box()
+        if pre_box is not None:
+            px, py, pz, pl, pw, ph = pre_box
+            plan_dict["pre_occupied"] = {
+                "x": px, "y": py, "z": pz,
+                "l": pl, "b": pw, "h": ph,
             }
-        )
+        preview_plans.append(plan_dict)
     return preview_plans
 
 
