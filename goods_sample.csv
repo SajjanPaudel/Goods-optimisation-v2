@@ -1,6 +1,7 @@
 ﻿id,truck_id,name,weight_kg,l,b,h,stackable,max_stack,adr,adr_class,adr_class_2
-1,VC8543,1:Rør,100.00,12.00,1,0.20,true,1,true,1,
+1,VC8543,1:Rør,100.00,12.00,0.2,0.20,true,1,true,1,
 2,VC8543,4.2:Pall,300.00,7.3,1,1,true,2,true,1,
 3,VC8543,no Adr:Pall (SBR)1,260.00,3.30,0.80,0.65,true,1,true,1.5,
 4,VC8543,4.2:Pall (SBR),220.00,7.3,1,1,true,2,true,1,
 5,VC8543,1:adr,60.00,1.20,0.80,0.35,true,1,true,1,
+6,VC8543,Tank,220.00,5,2.5,1,true,2,true,1,

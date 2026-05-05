@@ -5,6 +5,7 @@ import html
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from numpy._core.numeric import False_
 
 
 _MESH_I = [7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2]
@@ -206,6 +207,232 @@ def _plotly_weight_balance_traces(
     return traces
 
 
+# Pre-occupied (unused deck): muted fill + diagonal stripes read as “blocked”.
+_PRE_OCCUPIED_MESH_RGB = "rgb(178, 182, 192)"
+_PRE_OCCUPIED_MESH_OPACITY = 0.48
+_PRE_OCCUPIED_STRIPE_RGB = "rgb(72, 76, 88)"
+_PRE_OCCUPIED_EDGE_RGB = "rgb(52, 56, 66)"
+_PRE_OCCUPIED_LABEL_RGB = "rgb(38, 42, 52)"
+
+
+def _pre_occupied_boxes_from_plan(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    regions = plan.get("pre_occupied_regions")
+    if isinstance(regions, list) and regions:
+        return list(regions)
+    pre = plan.get("pre_occupied")
+    return [pre] if pre else []
+
+
+def _rect_diagonal_stripe_segments_uv(
+    u0: float,
+    v0: float,
+    u1: float,
+    v1: float,
+    spacing: float,
+) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """Segments inside [u0,u1]×[v0,v1] along lines u+v=k (//// pattern when mapped to horizontal faces)."""
+    if spacing <= 1e-9:
+        return []
+    du, dv = u1 - u0, v1 - v0
+    span = (du * du + dv * dv) ** 0.5
+    sp = max(spacing, span / 22.0)
+    segments: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+    k = u0 + v0
+    k_hi = u1 + v1
+    while k <= k_hi + 1e-9:
+        pts: List[Tuple[float, float]] = []
+        # Vertical boundaries u=u0, u=u1
+        for uf in (u0, u1):
+            vf = k - uf
+            if v0 - 1e-9 <= vf <= v1 + 1e-9:
+                pts.append((uf, vf))
+        # Horizontal boundaries v=v0, v=v1
+        for vf in (v0, v1):
+            uf = k - vf
+            if u0 - 1e-9 <= uf <= u1 + 1e-9:
+                pts.append((uf, vf))
+        uniq: List[Tuple[float, float]] = []
+        for p in pts:
+            if not any(abs(p[0] - q[0]) < 1e-6 and abs(p[1] - q[1]) < 1e-6 for q in uniq):
+                uniq.append(p)
+        if len(uniq) >= 2:
+            uniq.sort(key=lambda t: (t[0], t[1]))
+            segments.append((uniq[0], uniq[-1]))
+        k += sp
+    return segments
+
+
+def _plotly_pre_occupied_stripe_trace(
+    xs: List[Optional[float]],
+    ys: List[Optional[float]],
+    zs: List[Optional[float]],
+) -> Any:
+    import plotly.graph_objects as go
+
+    return go.Scatter3d(
+        x=xs,
+        y=ys,
+        z=zs,
+        mode="lines",
+        line=dict(color=_PRE_OCCUPIED_STRIPE_RGB, width=2),
+        hoverinfo="skip",
+        showlegend=False,
+    )
+
+
+def _plotly_append_face_stripes_xy(
+    traces: List[Any],
+    z_plane: float,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    spacing: float,
+) -> None:
+    seg_uv = _rect_diagonal_stripe_segments_uv(x0, y0, x1, y1, spacing)
+    if not seg_uv:
+        return
+    xs: List[Optional[float]] = []
+    ys: List[Optional[float]] = []
+    zs: List[Optional[float]] = []
+    for (ua, va), (ub, vb) in seg_uv:
+        xs.extend([ua, ub, None])
+        ys.extend([va, vb, None])
+        zs.extend([z_plane, z_plane, None])
+    traces.append(_plotly_pre_occupied_stripe_trace(xs, ys, zs))
+
+
+def _plotly_append_face_stripes_xz(
+    traces: List[Any],
+    y_plane: float,
+    x0: float,
+    z0: float,
+    x1: float,
+    z1: float,
+    spacing: float,
+) -> None:
+    seg_uv = _rect_diagonal_stripe_segments_uv(x0, z0, x1, z1, spacing)
+    if not seg_uv:
+        return
+    xs: List[Optional[float]] = []
+    ys: List[Optional[float]] = []
+    zs: List[Optional[float]] = []
+    for (ua, va), (ub, vb) in seg_uv:
+        xs.extend([ua, ub, None])
+        ys.extend([y_plane, y_plane, None])
+        zs.extend([va, vb, None])
+    traces.append(_plotly_pre_occupied_stripe_trace(xs, ys, zs))
+
+
+def _plotly_append_face_stripes_yz(
+    traces: List[Any],
+    x_plane: float,
+    y0: float,
+    z0: float,
+    y1: float,
+    z1: float,
+    spacing: float,
+) -> None:
+    seg_uv = _rect_diagonal_stripe_segments_uv(y0, z0, y1, z1, spacing)
+    if not seg_uv:
+        return
+    xs: List[Optional[float]] = []
+    ys: List[Optional[float]] = []
+    zs: List[Optional[float]] = []
+    for (ua, va), (ub, vb) in seg_uv:
+        xs.extend([x_plane, x_plane, None])
+        ys.extend([ua, ub, None])
+        zs.extend([va, vb, None])
+    traces.append(_plotly_pre_occupied_stripe_trace(xs, ys, zs))
+
+
+def _plotly_pre_occupied_traces(box: Dict[str, Any]) -> List[Any]:
+    """Semi-transparent unused-looking box plus diagonal hatch on major faces."""
+    import plotly.graph_objects as go
+
+    x0 = float(box["x"])
+    y0 = float(box["y"])
+    z0 = float(box["z"])
+    l = float(box["l"])
+    b = float(box["b"])
+    h = float(box["h"])
+    vx, vy, vz = _mesh3d_box_vertices(x0, y0, z0, l, b, h)
+    x1, y1, z1 = x0 + l, y0 + b, z0 + h
+    spacing = max(0.16, min(l, b, h, max(l, b, h)) * 0.11)
+
+    hover = (
+        "<b>Pre-occupied (unused)</b><br>"
+        f"<b>Position</b> {x0:.3f}, {y0:.3f}, {z0:.3f} m<br>"
+        f"<b>Dimensions</b> {l:.3f} × {b:.3f} × {h:.3f} m<br>"
+        f"<b>Volume</b> {l * b * h:.2f} m³"
+        "<extra></extra>"
+    )
+
+    traces: List[Any] = [
+        go.Mesh3d(
+            x=vx,
+            y=vy,
+            z=vz,
+            i=_MESH_I,
+            j=_MESH_J,
+            k=_MESH_K,
+            color=_PRE_OCCUPIED_MESH_RGB,
+            opacity=_PRE_OCCUPIED_MESH_OPACITY,
+            hovertemplate=hover,
+            name="Pre-occupied",
+            showlegend=False,
+            lighting=dict(ambient=0.95, diffuse=0.12, specular=0.05),
+            flatshading=True,
+        )
+    ]
+
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    xs_e: List[Optional[float]] = []
+    ys_e: List[Optional[float]] = []
+    zs_e: List[Optional[float]] = []
+    for i, j in edges:
+        xs_e.extend([vx[i], vx[j], None])
+        ys_e.extend([vy[i], vy[j], None])
+        zs_e.extend([vz[i], vz[j], None])
+    traces.append(
+        go.Scatter3d(
+            x=xs_e,
+            y=ys_e,
+            z=zs_e,
+            mode="lines",
+            line=dict(color=_PRE_OCCUPIED_EDGE_RGB, width=3),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    _plotly_append_face_stripes_xy(traces, z0, x0, y0, x1, y1, spacing)
+    _plotly_append_face_stripes_xy(traces, z1, x0, y0, x1, y1, spacing)
+    _plotly_append_face_stripes_xz(traces, y0, x0, z0, x1, z1, spacing)
+    _plotly_append_face_stripes_xz(traces, y1, x0, z0, x1, z1, spacing)
+    _plotly_append_face_stripes_yz(traces, x0, y0, z0, y1, z1, spacing)
+    _plotly_append_face_stripes_yz(traces, x1, y0, z0, y1, z1, spacing)
+
+    traces.append(
+        go.Scatter3d(
+            x=[x0 + l / 2.0],
+            y=[y0],
+            z=[z0 + h / 2.0],
+            mode="text",
+            text=["<b>Unused</b>"],
+            textfont=dict(size=11, color=_PRE_OCCUPIED_LABEL_RGB),
+            textposition="middle center",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    return traces
+
+
 def _plotly_truck_base_trace(l: float, b: float, truck_name: str) -> Any:
     import plotly.graph_objects as go
 
@@ -245,12 +472,16 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         d = p["truck_dims"]
         tl, tb, th = d["l"], d["b"], d["h"]
         truck_volume = float(tl) * float(tb) * float(th)
+        pre_boxes = _pre_occupied_boxes_from_plan(p)
+        pre_volume = sum(float(b["l"]) * float(b["b"]) * float(b["h"]) for b in pre_boxes)
+        usable_volume = max(truck_volume - pre_volume, 0.0)
         placed_volume = sum(float(item["l"]) * float(item["b"]) * float(item["h"]) for item in p["placements"])
-        volume_util_pct = (placed_volume / truck_volume * 100.0) if truck_volume > 0 else 0.0
+        volume_util_pct = (placed_volume / usable_volume * 100.0) if usable_volume > 0 else 0.0
+        pre_suffix = f", {pre_volume:.1f} m³ pre-occupied" if pre_boxes else ""
         titles.append(
             f"{p['truck']} {tl:g}m × {tb:g}m × {th:g}m<br>"
             f"{p['placed_count']} goods, {p['weight_util_pct']:.0f}% wt, "
-            f"{placed_volume:.1f}/{truck_volume:.1f} m³ ({volume_util_pct:.0f}% vol)"
+            f"{placed_volume:.1f}/{usable_volume:.1f} m³ ({volume_util_pct:.0f}% vol){pre_suffix}"
         )
     while len(titles) < rows * cols:
         titles.append("")
@@ -272,6 +503,10 @@ def build_plotly_figure(plans: List[Dict[str, Any]], title: str) -> Any:
         tl, tb, th = dims["l"], dims["b"], dims["h"]
         fig.add_trace(_plotly_truck_base_trace(tl, tb, plan["truck"]), row=r, col=c)
         fig.add_trace(_plotly_truck_wireframe_trace(tl, tb, th), row=r, col=c)
+
+        for pre_box in _pre_occupied_boxes_from_plan(plan):
+            for trace in _plotly_pre_occupied_traces(pre_box):
+                fig.add_trace(trace, row=r, col=c)
 
         seg_weights = _resolve_segment_weights(plan)
         seg_labels = plan.get("segment_labels") or None
@@ -407,6 +642,44 @@ def show_load_preview(
             linewidths=1.0,
         )
         ax.add_collection3d(hull)
+        for pre_box in _pre_occupied_boxes_from_plan(plan):
+            px = float(pre_box["x"])
+            py = float(pre_box["y"])
+            pz = float(pre_box["z"])
+            pl = float(pre_box["l"])
+            pb = float(pre_box["b"])
+            ph = float(pre_box["h"])
+            hatch_spacing = max(0.16, min(pl, pb, ph, max(pl, pb, ph)) * 0.11)
+            face_rgba = [(0.72, 0.73, 0.76, 0.62)] * 6
+            pre_poly = Poly3DCollection(
+                _box_faces(px, py, pz, pl, pb, ph),
+                facecolors=face_rgba,
+                edgecolors=(0.32, 0.34, 0.38, 0.92),
+                linewidths=0.85,
+            )
+            ax.add_collection3d(pre_poly)
+            stripe_rgb = (0.29, 0.31, 0.36)
+            x1, y1, z1 = px + pl, py + pb, pz + ph
+            for zp in (pz, z1):
+                for (ua, va), (ub, vb) in _rect_diagonal_stripe_segments_uv(px, py, x1, y1, hatch_spacing):
+                    ax.plot([ua, ub], [va, vb], [zp, zp], color=stripe_rgb, lw=0.95)
+            for yp in (py, y1):
+                for (ua, va), (ub, vb) in _rect_diagonal_stripe_segments_uv(px, pz, x1, z1, hatch_spacing):
+                    ax.plot([ua, ub], [yp, yp], [va, vb], color=stripe_rgb, lw=0.95)
+            for xp in (px, x1):
+                for (ua, va), (ub, vb) in _rect_diagonal_stripe_segments_uv(py, pz, y1, z1, hatch_spacing):
+                    ax.plot([xp, xp], [ua, ub], [va, vb], color=stripe_rgb, lw=0.95)
+            ax.text(
+                px + pl / 2.0,
+                py,
+                pz + ph / 2.0,
+                "Unused",
+                color=(0.18, 0.2, 0.24),
+                ha="center",
+                va="center",
+                fontsize=9,
+                weight="bold",
+            )
         for j, p in enumerate(plan["placements"]):
             poly = Poly3DCollection(
                 _box_faces(p["x"], p["y"], p["z"], p["l"], p["b"], p["h"]),
